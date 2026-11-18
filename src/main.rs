@@ -1,11 +1,15 @@
 mod capture;
 mod clipboard;
 mod draw;
+mod editor;
 mod overlay;
 mod record;
+mod session;
 mod shortcuts;
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -44,11 +48,13 @@ use clipboard::{Clipboard, Payload};
 use draw::{Sel, Tool};
 use overlay::{Mode, Outcome, Overlay};
 use record::Recording;
+use session::Session;
 use shortcuts::Action;
 
 pub enum Msg {
     Shortcut(Action),
     RecordingDone(Result<PathBuf, String>),
+    Note(usize, String),
     Fatal(String),
 }
 
@@ -77,9 +83,12 @@ pub struct App {
     pointer_serial: u32,
     cursor: Option<Shape>,
     overlay: Option<Overlay>,
+    ring: Option<Overlay>,
     opened_at: Option<(Instant, Duration)>,
     pending_record: Option<(i32, i32, u32, u32)>,
     recording: Option<Recording>,
+    session: Option<Session>,
+    shot_at: Option<Duration>,
     stopping: bool,
     fatal: Option<String>,
 }
@@ -87,8 +96,16 @@ pub struct App {
 pub struct Ud;
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("ahri: {e}");
+    let args: Vec<String> = std::env::args().collect();
+    let result = match args.get(1).map(String::as_str) {
+        Some("editor") => editor::run(
+            args.get(2).map_or("Anotação", String::as_str),
+            args.get(3).map_or("cancela", String::as_str),
+        ),
+        _ => run(),
+    };
+    if let Err(e) = result {
+        eprintln!("nino: {e}");
         std::process::exit(1);
     }
 }
@@ -126,7 +143,7 @@ fn run() -> Result<(), String> {
             .bind(&qh, 1..=1, Ud)
             .map_err(|e| format!("wp_viewporter: {e}"))?,
         cursor_shape: CursorShapeManager::bind(&globals, &qh).ok(),
-        clipboard: Clipboard::bind(&globals, &qh).map_err(|e| eprintln!("ahri: {e}")).ok(),
+        clipboard: Clipboard::bind(&globals, &qh).map_err(|e| eprintln!("nino: {e}")).ok(),
         shm,
         wayland: conn.clone(),
         pool,
@@ -140,15 +157,18 @@ fn run() -> Result<(), String> {
         pointer_serial: 0,
         cursor: None,
         overlay: None,
+        ring: None,
         opened_at: None,
         pending_record: None,
         recording: None,
+        session: None,
+        shot_at: None,
         stopping: false,
         fatal: None,
     };
 
     shortcuts::spawn(tx);
-    eprintln!("ahri: ready");
+    eprintln!("nino: ready");
 
     loop {
         event_loop.dispatch(None, &mut app).map_err(|e| e.to_string())?;
@@ -162,7 +182,7 @@ impl App {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Shortcut(Action::Screenshot) => {
-                if self.overlay.is_none() {
+                if self.overlay.is_none() && !self.editing() {
                     self.open_shot();
                 }
             }
@@ -174,34 +194,124 @@ impl App {
                     }
                 } else if self.overlay.as_ref().is_some_and(|o| !o.is_shot()) {
                     self.close_overlay();
-                } else if self.overlay.is_none() {
+                } else if self.overlay.is_none() && self.session.is_none() {
                     self.open_record();
                 }
             }
+            Msg::Shortcut(Action::Note) => self.open_note(),
             Msg::RecordingDone(result) => {
                 self.recording = None;
                 self.stopping = false;
-                self.close_overlay();
+                self.close_ring();
                 match result {
                     Ok(path) => {
-                        eprintln!("ahri: saved {}", path.display());
-                        self.copy_file(&path);
+                        eprintln!("nino: saved {}", path.display());
+                        if let Some(session) = self.session.as_mut() {
+                            session.video = Some(path);
+                        }
                     }
                     Err(e) => {
-                        eprintln!("ahri: recording failed: {e}");
+                        eprintln!("nino: recording failed: {e}");
                         self.notify("Falha na gravação", &e);
                     }
                 }
+                self.finish_session();
+            }
+            Msg::Note(id, text) => {
+                if let Some(session) = self.session.as_mut() {
+                    session.editing = false;
+                    session.set_text(id, text);
+                }
+                self.finish_session();
             }
             Msg::Fatal(e) => self.fatal = Some(e),
         }
     }
 
+    fn editing(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.editing)
+    }
+
+    fn open_note(&mut self) {
+        if self.recording.is_none() || self.overlay.is_some() || self.editing() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else { return };
+        let (id, title) = session.add_note(session.elapsed());
+        self.open_editor(id, &title, "cancela");
+    }
+
+    fn open_editor(&mut self, id: usize, title: &str, esc: &str) {
+        let Some(session) = self.session.as_mut() else { return };
+        let child = std::env::current_exe().and_then(|exe| {
+            Command::new(exe)
+                .args(["editor", title, esc])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+        });
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("nino: editor: {e}");
+                self.notify("Falha ao abrir a anotação", &e.to_string());
+                return;
+            }
+        };
+        session.editing = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut text);
+            }
+            let _ = child.wait();
+            let _ = tx.send(Msg::Note(id, text.trim().to_string()));
+        });
+    }
+
+    fn finish_session(&mut self) {
+        if self.recording.is_some() || self.editing() {
+            return;
+        }
+        let Some(session) = self.session.take() else { return };
+        let finished = match session.finish() {
+            Ok(finished) => finished,
+            Err(e) => {
+                eprintln!("nino: session: {e}");
+                self.notify("Falha ao salvar a sessão", &e);
+                return;
+            }
+        };
+        let uris: Vec<String> = finished
+            .files
+            .iter()
+            .map(|p| format!("file://{}", encode_path(p)))
+            .collect();
+        if uris.is_empty() {
+            return;
+        }
+        let mut entries = vec![
+            ("text/uri-list", format!("{}\r\n", uris.join("\r\n")).into_bytes()),
+            (
+                "x-special/gnome-copied-files",
+                format!("copy\n{}", uris.join("\n")).into_bytes(),
+            ),
+        ];
+        if let Some(notes) = finished.notes {
+            entries.push(("text/plain;charset=utf-8", notes.clone().into_bytes()));
+            entries.push(("text/plain", notes.into_bytes()));
+        }
+        self.set_clipboard(Payload { entries });
+        eprintln!("nino: copied {} files", uris.len());
+    }
+
     fn open_shot(&mut self) {
+        self.shot_at = self.session.as_ref().map(Session::elapsed);
         let started = Instant::now();
         let (layer, viewport) = self.new_layer();
         if let Err(e) = self.wayland.flush() {
-            eprintln!("ahri: wayland flush: {e}");
+            eprintln!("nino: wayland flush: {e}");
         }
         match capture::capture_active_screen(&self.dbus) {
             Ok(shot) => {
@@ -211,7 +321,7 @@ impl App {
             Err(e) => {
                 viewport.destroy();
                 drop(layer);
-                eprintln!("ahri: capture failed: {e}");
+                eprintln!("nino: capture failed: {e}");
                 self.notify("Falha no print", &e);
             }
         }
@@ -246,6 +356,13 @@ impl App {
         }
     }
 
+    fn close_ring(&mut self) {
+        if let Some(ring) = self.ring.take() {
+            ring.viewport.destroy();
+            drop(ring.layer);
+        }
+    }
+
     fn redraw(&mut self, qh: &QueueHandle<Self>) {
         let Some(ov) = self.overlay.as_mut() else { return };
         if ov.size.is_none() {
@@ -257,7 +374,7 @@ impl App {
         }
         let render_started = Instant::now();
         if let Err(e) = ov.present(&mut self.pool) {
-            eprintln!("ahri: present: {e}");
+            eprintln!("nino: present: {e}");
             return;
         }
         let surface = ov.layer.wl_surface();
@@ -268,7 +385,7 @@ impl App {
         if let Some((started, capture)) = self.opened_at.take() {
             let mode = if ov.is_shot() { "shot" } else { "record" };
             eprintln!(
-                "ahri: {mode} overlay shown in {:?} (capture {:?}, configure wait {:?}, render {:?})",
+                "nino: {mode} overlay shown in {:?} (capture {:?}, configure wait {:?}, render {:?})",
                 started.elapsed(),
                 capture,
                 render_started.duration_since(started).saturating_sub(capture),
@@ -299,16 +416,27 @@ impl App {
         let png = match draw::encode_png(&image) {
             Ok(png) => png,
             Err(e) => {
-                eprintln!("ahri: png: {e}");
+                eprintln!("nino: png: {e}");
                 return;
             }
         };
+        if let Some(session) = self.session.as_mut() {
+            let at = self.shot_at.take().unwrap_or_else(|| session.elapsed());
+            match session.add_print(at, &png) {
+                Ok((id, title)) => self.open_editor(id, &title, "pula"),
+                Err(e) => {
+                    eprintln!("nino: print: {e}");
+                    self.notify("Falha ao salvar o print", &e);
+                }
+            }
+            return;
+        }
         let size = png.len();
         self.set_clipboard(Payload {
             entries: vec![("image/png", png)],
         });
         eprintln!(
-            "ahri: copied {}x{} png ({} KiB) in {:?}",
+            "nino: copied {}x{} png ({} KiB) in {:?}",
             image.width(),
             image.height(),
             size / 1024,
@@ -316,22 +444,12 @@ impl App {
         );
     }
 
-    fn copy_file(&mut self, path: &std::path::Path) {
-        let uri = format!("file://{}", encode_path(path));
-        self.set_clipboard(Payload {
-            entries: vec![
-                ("text/uri-list", format!("{uri}\r\n").into_bytes()),
-                ("x-special/gnome-copied-files", format!("copy\n{uri}").into_bytes()),
-            ],
-        });
-    }
-
     fn set_clipboard(&mut self, payload: Payload) {
         let qh = self.qh.clone();
         match self.clipboard.as_mut().map(|c| c.set(payload, &qh)) {
             Some(Ok(())) => {}
-            Some(Err(e)) => eprintln!("ahri: clipboard: {e}"),
-            None => eprintln!("ahri: clipboard unavailable"),
+            Some(Err(e)) => eprintln!("nino: clipboard: {e}"),
+            None => eprintln!("nino: clipboard unavailable"),
         }
     }
 
@@ -370,13 +488,20 @@ impl App {
     }
 
     fn begin_recording(&mut self, (x, y, w, h): (i32, i32, u32, u32)) {
-        match Recording::start(x, y, w, h, self.tx.clone()) {
-            Ok(rec) => {
-                eprintln!("ahri: recording {w}x{h}+{x}+{y} -> {}", rec.path.display());
+        let started = Session::new().and_then(|session| {
+            let rec = Recording::start(session.video_path(), x, y, w, h, self.tx.clone())
+                .inspect_err(|_| _ = std::fs::remove_dir(&session.dir))?;
+            Ok((session, rec))
+        });
+        match started {
+            Ok((session, rec)) => {
+                eprintln!("nino: recording {w}x{h}+{x}+{y} -> {}", rec.path.display());
+                self.session = Some(session);
                 self.recording = Some(rec);
+                self.ring = self.overlay.take();
             }
             Err(e) => {
-                eprintln!("ahri: {e}");
+                eprintln!("nino: {e}");
                 self.close_overlay();
                 self.notify("Falha na gravação", &e);
             }
@@ -384,13 +509,13 @@ impl App {
     }
 
     fn notify(&self, summary: &str, body: &str) {
-        let hints = std::collections::HashMap::from([("desktop-entry", zbus::Variant::from("ahri"))]);
+        let hints = std::collections::HashMap::from([("desktop-entry", zbus::Variant::from("nino"))]);
         let _ = zbus::block_on(self.dbus.call_method(
             Some("org.freedesktop.Notifications"),
             "/org/freedesktop/Notifications",
             Some("org.freedesktop.Notifications"),
             "Notify",
-            &("Ahri", 0u32, "ahri", summary, body, Vec::<&str>::new(), hints, 4000i32),
+            &("Nino", 0u32, "nino", summary, body, Vec::<&str>::new(), hints, 4000i32),
         ));
     }
 }
@@ -458,6 +583,9 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         if self.overlay.as_ref().is_some_and(|o| &o.layer == layer) {
             self.close_overlay();
+        }
+        if self.ring.as_ref().is_some_and(|o| &o.layer == layer) {
+            self.close_ring();
         }
     }
 

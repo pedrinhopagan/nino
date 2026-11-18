@@ -5,10 +5,11 @@ use zbus::{Connection, DynamicType, MatchRule, MessageStream, OwnedObjectPath};
 
 use crate::Msg;
 
-const COMPONENT: &str = "ahri";
-const COMPONENT_NAME: &str = "Ahri";
+const COMPONENT: &str = "nino";
+const COMPONENT_NAME: &str = "Nino";
 const META: i32 = 0x1000_0000;
 const SHIFT: i32 = 0x0200_0000;
+const KEY_N: i32 = 0x4E;
 const KEY_R: i32 = 0x52;
 const KEY_S: i32 = 0x53;
 const SET_PRESENT_NO_AUTOLOADING: u32 = 2 | 4;
@@ -18,9 +19,10 @@ const TAKEOVER_FROM: &str = "org.kde.spectacle.desktop";
 pub enum Action {
     Screenshot,
     Record,
+    Note,
 }
 
-const ACTIONS: [(Action, &str, &str, i32); 2] = [
+const ACTIONS: [(Action, &str, &str, i32); 3] = [
     (
         Action::Screenshot,
         "screenshot",
@@ -28,12 +30,13 @@ const ACTIONS: [(Action, &str, &str, i32); 2] = [
         META | SHIFT | KEY_S,
     ),
     (Action::Record, "record", "Gravar região", META | KEY_R),
+    (Action::Note, "note", "Anotar na gravação", META | KEY_N),
 ];
 
 pub fn spawn(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         if let Err(e) = zbus::block_on(run(&tx)) {
-            eprintln!("ahri: shortcuts: {e}");
+            eprintln!("nino: shortcuts: {e}");
             let _ = tx.send(Msg::Fatal(format!("shortcuts: {e}")));
         }
     });
@@ -82,14 +85,14 @@ async fn register(conn: &Connection, name: &str, friendly: &str, key: i32) -> zb
         Some(TAKEOVER_FROM) => {
             let keys: Vec<i32> = call(conn, "shortcut", &(&owner,)).await?.body().deserialize()?;
             let keep: Vec<i32> = keys.into_iter().filter(|k| *k != key).collect();
-            eprintln!("ahri: taking {friendly} shortcut from {}", owner[..2].join("/"));
+            eprintln!("nino: taking {friendly} shortcut from {}", owner[..2].join("/"));
             call(conn, "setForeignShortcut", &(&owner, keep)).await?;
         }
-        Some(_) => eprintln!("ahri: {friendly} shortcut is also bound to {}", owner[..2].join("/")),
+        Some(_) => eprintln!("nino: {friendly} shortcut is also bound to {}", owner[..2].join("/")),
     }
 
     if !set(conn, &id, key).await? {
-        eprintln!("ahri: kglobalaccel refused shortcut for {name}");
+        eprintln!("nino: kglobalaccel refused shortcut for {name}");
     }
     Ok(())
 }

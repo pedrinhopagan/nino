@@ -70,7 +70,7 @@ impl Clipboard {
             };
             let mut file = std::fs::File::from(fd);
             if let Err(e) = file.write_all(bytes) {
-                eprintln!("ahri: clipboard write {mime}: {e}");
+                eprintln!("nino: clipboard write {mime}: {e}");
             }
         });
     }

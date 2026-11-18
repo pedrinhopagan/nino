@@ -11,12 +11,7 @@ pub struct Recording {
 }
 
 impl Recording {
-    pub fn start(x: i32, y: i32, w: u32, h: u32, tx: Sender<Msg>) -> Result<Self, String> {
-        let dir = videos_dir().join("Ahri");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let name = chrono::Local::now().format("ahri_%Y-%m-%d_%H-%M-%S.mp4").to_string();
-        let path = dir.join(name);
-
+    pub fn start(path: PathBuf, x: i32, y: i32, w: u32, h: u32, tx: Sender<Msg>) -> Result<Self, String> {
         let mut child = Command::new("gpu-screen-recorder")
             .args(["-w", &format!("{w}x{h}+{x}+{y}")])
             .args(["-f", "60", "-k", "h264", "-c", "mp4", "-cursor", "yes"])
@@ -57,17 +52,4 @@ impl Recording {
             libc::kill(self.pid, libc::SIGINT);
         }
     }
-}
-
-fn videos_dir() -> PathBuf {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let dirs = std::fs::read_to_string(config.join("user-dirs.dirs")).unwrap_or_default();
-    dirs.lines()
-        .find_map(|l| l.strip_prefix("XDG_VIDEOS_DIR="))
-        .map(|v| v.trim_matches('"').replace("$HOME", &home.to_string_lossy()))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join("Videos"))
 }

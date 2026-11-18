@@ -1,14 +1,18 @@
 [package]
-name = "ahri"
+name = "nino"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 chrono = "0.4.45"
+gtk = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+javascriptcore-rs = "1.1"
 libc = "0.2.191"
 png = "0.18"
 smithay-client-toolkit = "0.21"
 tiny-skia = "0.12"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+webkit2gtk = { version = "2.0", features = ["v2_22"] }
 zbus = { version = "6", default-features = false, features = ["default-rt"] }

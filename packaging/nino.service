@@ -1,10 +1,10 @@
 [Unit]
-Description=Ahri screenshot and screen recording daemon
+Description=Nino screenshot, recording and notes daemon
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/ahri
+ExecStart=%h/.local/bin/nino
 Restart=on-failure
 RestartSec=2
 
