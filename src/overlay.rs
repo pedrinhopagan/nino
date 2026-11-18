@@ -3,13 +3,15 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::LayerSurface;
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use tiny_skia::{
-    BlendMode, Color, FillRule, IntRect, Mask, Paint, PathBuilder, Pixmap, PixmapMut, Point, Rect, Stroke, Transform,
+    BlendMode, Color, FillRule, IntRect, Mask, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Point, Rect, Stroke,
+    Transform,
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
 
 use crate::draw::{self, Mark, Sel, Tool};
+use crate::session::Region;
 
 pub enum Mode {
     Shot { shot: Pixmap },
@@ -21,6 +23,7 @@ enum Drag {
     Selecting(Point),
     Marking(Mark),
     Resizing(Sel, Edges),
+    Slider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,7 +54,15 @@ enum Hit {
     Tool(Tool),
     ColorButton,
     Swatch(usize),
+    Slider,
     Panel,
+}
+
+pub struct Doc {
+    size: (u32, u32),
+    crop: Option<(Pixmap, i32, i32)>,
+    marks: Vec<Mark>,
+    sel: Option<Sel>,
 }
 
 pub enum Outcome {
@@ -68,6 +79,24 @@ const MARK_WIDTH: f32 = 4.0;
 const MIN_SEL: f32 = 4.0;
 const RING_GAP: f32 = 4.0;
 const GRAB: f32 = 8.0;
+type Layout = (Vec<(Hit, Rect)>, Vec<Rect>);
+const SEP: f32 = 4.0;
+const SLIDER: f32 = 220.0;
+const BLUR_MIN: f32 = 2.0;
+const BLUR_MAX: f32 = 30.0;
+const BAR: [Option<Hit>; 11] = [
+    Some(Hit::Tool(Tool::Draw)),
+    Some(Hit::Tool(Tool::Arrow)),
+    None,
+    Some(Hit::Tool(Tool::Rect)),
+    Some(Hit::Tool(Tool::Fill)),
+    Some(Hit::Tool(Tool::Ellipse)),
+    Some(Hit::Tool(Tool::Disc)),
+    None,
+    Some(Hit::Tool(Tool::Blur)),
+    None,
+    Some(Hit::ColorButton),
+];
 
 pub struct Overlay {
     pub layer: LayerSurface,
@@ -83,11 +112,14 @@ pub struct Overlay {
     marks: Vec<Mark>,
     tool: Tool,
     color: usize,
+    blur: f32,
     palette_open: bool,
     pub frame_pending: bool,
     pub dirty: bool,
     mask: Option<(Sel, Mask)>,
     ring: Option<Sel>,
+    preset: Option<Sel>,
+    pub holes: Vec<Region>,
 }
 
 impl Overlay {
@@ -106,12 +138,24 @@ impl Overlay {
             marks: Vec::new(),
             tool: Tool::Draw,
             color: 0,
+            blur: 0.35,
             palette_open: false,
             frame_pending: false,
             dirty: true,
             mask: None,
             ring: None,
+            preset: None,
+            holes: Vec::new(),
         }
+    }
+
+    pub fn with_selection(mut self, logical: Sel) -> Self {
+        self.preset = Some(logical);
+        self
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.sel.is_some()
     }
 
     pub fn is_shot(&self) -> bool {
@@ -125,6 +169,15 @@ impl Overlay {
             Mode::Record => (w, h),
         };
         self.scale = bw as f32 / w as f32;
+        if let Some(p) = self.preset.take() {
+            let s = self.scale;
+            self.sel = Some(Sel {
+                x: p.x * s,
+                y: p.y * s,
+                w: p.w * s,
+                h: p.h * s,
+            });
+        }
         if self.size != Some((bw, bh)) {
             self.size = Some((bw, bh));
             self.buffers.clear();
@@ -143,6 +196,10 @@ impl Overlay {
                 Hit::Tool(tool) => self.set_tool(tool),
                 Hit::ColorButton => self.toggle_palette(),
                 Hit::Swatch(i) => self.number(i + 1),
+                Hit::Slider => {
+                    self.drag = Drag::Slider;
+                    self.slide(p.x)
+                }
                 Hit::Panel => Outcome::Nothing,
             };
         }
@@ -157,6 +214,9 @@ impl Overlay {
                 Tool::Arrow => Mark::Arrow(p, p, draw::palette(self.color)),
                 Tool::Rect => Mark::Rect(p, p, draw::palette(self.color)),
                 Tool::Ellipse => Mark::Ellipse(p, p, draw::palette(self.color)),
+                Tool::Fill => Mark::Fill(p, p, draw::palette(self.color)),
+                Tool::Disc => Mark::Disc(p, p, draw::palette(self.color)),
+                Tool::Blur => Mark::Blur(p, p, self.blur_radius()),
             });
         } else {
             self.drag = Drag::Selecting(p);
@@ -166,7 +226,11 @@ impl Overlay {
     }
 
     pub fn motion(&mut self, p: Point, shift: bool) -> Outcome {
+        if matches!(self.drag, Drag::Slider) {
+            return self.slide(p.x);
+        }
         match &mut self.drag {
+            Drag::Slider => {}
             Drag::None => return Outcome::Nothing,
             Drag::Selecting(start) => self.sel = Some(Sel::from_points(*start, p)),
             Drag::Resizing(orig, edges) => {
@@ -187,7 +251,13 @@ impl Overlay {
             }
             Drag::Marking(Mark::Draw(points, _)) => points.push(p),
             Drag::Marking(Mark::Arrow(_, end, _)) => *end = p,
-            Drag::Marking(Mark::Rect(start, end, _) | Mark::Ellipse(start, end, _)) => {
+            Drag::Marking(
+                Mark::Rect(start, end, _)
+                | Mark::Ellipse(start, end, _)
+                | Mark::Fill(start, end, _)
+                | Mark::Disc(start, end, _)
+                | Mark::Blur(start, end, _),
+            ) => {
                 *end = if shift { draw::squared(*start, p) } else { p };
             }
         }
@@ -198,7 +268,14 @@ impl Overlay {
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         match drag {
             Drag::None => Outcome::Nothing,
-            Drag::Marking(Mark::Rect(a, b, _) | Mark::Ellipse(a, b, _)) if a == b => Outcome::Redraw,
+            Drag::Slider => Outcome::Redraw,
+            Drag::Marking(
+                Mark::Rect(a, b, _)
+                | Mark::Ellipse(a, b, _)
+                | Mark::Fill(a, b, _)
+                | Mark::Disc(a, b, _)
+                | Mark::Blur(a, b, _),
+            ) if a == b => Outcome::Redraw,
             Drag::Marking(mark) => {
                 self.marks.push(mark);
                 Outcome::Redraw
@@ -258,6 +335,9 @@ impl Overlay {
         if let Drag::Resizing(_, edges) = &self.drag {
             return edges.cursor();
         }
+        if matches!(self.drag, Drag::Slider) {
+            return Shape::Default;
+        }
         if !matches!(self.drag, Drag::None) {
             return Shape::Crosshair;
         }
@@ -301,8 +381,11 @@ impl Overlay {
             1 => self.set_tool(Tool::Draw),
             2 => self.set_tool(Tool::Arrow),
             3 => self.set_tool(Tool::Rect),
-            4 => self.set_tool(Tool::Ellipse),
-            5 => self.toggle_palette(),
+            4 => self.set_tool(Tool::Fill),
+            5 => self.set_tool(Tool::Ellipse),
+            6 => self.set_tool(Tool::Disc),
+            7 => self.set_tool(Tool::Blur),
+            8 => self.toggle_palette(),
             _ => Outcome::Nothing,
         }
     }
@@ -333,6 +416,49 @@ impl Overlay {
         Some(out)
     }
 
+    pub fn doc(&self) -> Option<Doc> {
+        let Mode::Shot { shot } = &self.mode else {
+            return None;
+        };
+        let crop = self.sel.and_then(|sel| {
+            let (x, y, w, h) = sel.snapped(shot.width(), shot.height());
+            let crop = shot.clone_rect(IntRect::from_xywh(x as i32, y as i32, w, h)?)?;
+            Some((crop, x as i32, y as i32))
+        });
+        Some(Doc {
+            size: (shot.width(), shot.height()),
+            crop,
+            marks: self.marks.clone(),
+            sel: self.sel,
+        })
+    }
+
+    pub fn load(&mut self, doc: &Doc) {
+        if !self.is_shot() || self.size != Some(doc.size) {
+            return;
+        }
+        let Some(mut shot) = Pixmap::new(doc.size.0, doc.size.1) else {
+            return;
+        };
+        shot.fill(Color::BLACK);
+        if let Some((crop, x, y)) = &doc.crop {
+            shot.draw_pixmap(
+                *x,
+                *y,
+                crop.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
+        self.mode = Mode::Shot { shot };
+        self.marks = doc.marks.clone();
+        self.sel = doc.sel;
+        self.drag = Drag::None;
+        self.palette_open = false;
+        self.dirty = true;
+    }
+
     fn all_marks(&self) -> impl Iterator<Item = &Mark> {
         let current = match &self.drag {
             Drag::Marking(mark) => Some(mark),
@@ -350,7 +476,11 @@ impl Overlay {
             return None;
         };
         let s = self.scale;
-        let (w, h) = ((BTN * 5.0 + PAD * 6.0) * s, (BTN + PAD * 2.0) * s);
+        let units: f32 = BAR
+            .iter()
+            .map(|b| if b.is_some() { BTN + PAD } else { SEP + PAD })
+            .sum();
+        let (w, h) = ((units + PAD) * s, (BTN + PAD * 2.0) * s);
         let gap = 8.0 * s;
         let (fw, fh) = (shot.width() as f32, shot.height() as f32);
         let x = (sel.x + sel.w - w).clamp(0.0, fw - w);
@@ -364,47 +494,61 @@ impl Overlay {
         Rect::from_xywh(x, y, w, h)
     }
 
-    fn button_rects(&self) -> Option<[(Hit, Rect); 5]> {
+    fn bar_layout(&self) -> Option<Layout> {
         let bar = self.toolbar_rect()?;
         let s = self.scale;
-        let b = |i: f32| {
-            Rect::from_xywh(
-                bar.x() + (PAD + i * (BTN + PAD)) * s,
-                bar.y() + PAD * s,
-                BTN * s,
-                BTN * s,
-            )
-        };
-        Some([
-            (Hit::Tool(Tool::Draw), b(0.0)?),
-            (Hit::Tool(Tool::Arrow), b(1.0)?),
-            (Hit::Tool(Tool::Rect), b(2.0)?),
-            (Hit::Tool(Tool::Ellipse), b(3.0)?),
-            (Hit::ColorButton, b(4.0)?),
-        ])
+        let (mut buttons, mut seps) = (Vec::new(), Vec::new());
+        let mut x = bar.x() + PAD * s;
+        for item in BAR {
+            match item {
+                Some(hit) => {
+                    buttons.push((hit, Rect::from_xywh(x, bar.y() + PAD * s, BTN * s, BTN * s)?));
+                    x += (BTN + PAD) * s;
+                }
+                None => {
+                    seps.push(Rect::from_xywh(
+                        x + (SEP / 2.0 - 0.5) * s,
+                        bar.y() + (PAD + 8.0) * s,
+                        s,
+                        (BTN - 16.0) * s,
+                    )?);
+                    x += (SEP + PAD) * s;
+                }
+            }
+        }
+        Some((buttons, seps))
     }
 
-    fn swatch_rects(&self) -> Option<Vec<(Hit, Rect)>> {
-        if !self.palette_open {
-            return None;
-        }
+    fn panel_below(&self, w: f32) -> Option<Rect> {
         let bar = self.toolbar_rect()?;
         let Mode::Shot { shot, .. } = &self.mode else {
             return None;
         };
-        let s = self.scale;
-        let n = draw::PALETTE.len() as f32;
-        let (w, h) = ((BTN * n + PAD * (n + 1.0)) * s, bar.height());
-        let gap = 6.0 * s;
+        let (h, gap) = (bar.height(), 6.0 * self.scale);
         let x = (bar.right() - w).clamp(0.0, shot.width() as f32 - w);
         let y = if bar.bottom() + gap + h <= shot.height() as f32 {
             bar.bottom() + gap
         } else {
             bar.top() - gap - h
         };
+        Rect::from_xywh(x, y, w, h)
+    }
+
+    fn swatch_rects(&self) -> Option<Vec<(Hit, Rect)>> {
+        if !self.palette_open {
+            return None;
+        }
+        let s = self.scale;
+        let n = draw::PALETTE.len() as f32;
+        let panel = self.panel_below((BTN * n + PAD * (n + 1.0)) * s)?;
         (0..draw::PALETTE.len())
             .map(|i| {
-                let r = Rect::from_xywh(x + (PAD + i as f32 * (BTN + PAD)) * s, y + PAD * s, BTN * s, BTN * s)?;
+                let r = Rect::from_xywh(
+                    panel.x() + (PAD + i as f32 * (BTN + PAD)) * s,
+                    panel.y() + PAD * s,
+                    BTN * s,
+                    BTN * s,
+                )?;
                 Some((Hit::Swatch(i), r))
             })
             .collect()
@@ -422,14 +566,49 @@ impl Overlay {
         )
     }
 
+    fn slider_rect(&self) -> Option<Rect> {
+        if self.tool != Tool::Blur || self.palette_open {
+            return None;
+        }
+        self.panel_below(SLIDER * self.scale)
+    }
+
+    fn slider_track(&self) -> Option<(f32, f32, f32)> {
+        let panel = self.slider_rect()?;
+        let inset = 20.0 * self.scale;
+        Some((
+            panel.left() + inset,
+            panel.right() - inset,
+            (panel.top() + panel.bottom()) / 2.0,
+        ))
+    }
+
+    fn slide(&mut self, x: f32) -> Outcome {
+        let Some((x0, x1, _)) = self.slider_track() else {
+            return Outcome::Nothing;
+        };
+        self.blur = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0);
+        let radius = self.blur_radius();
+        if let Some(Mark::Blur(_, _, r)) = self.marks.last_mut() {
+            *r = radius;
+        }
+        Outcome::Redraw
+    }
+
+    fn blur_radius(&self) -> f32 {
+        (BLUR_MIN + self.blur * (BLUR_MAX - BLUR_MIN)) * self.scale
+    }
+
     fn hit(&self, p: Point) -> Option<Hit> {
         let inside = |r: &Rect| p.x >= r.left() && p.x <= r.right() && p.y >= r.top() && p.y <= r.bottom();
         self.swatch_rects()
             .into_iter()
             .flatten()
-            .chain(self.button_rects().into_iter().flatten())
+            .chain(self.bar_layout().into_iter().flat_map(|(b, _)| b))
             .find(|(_, r)| inside(r))
             .map(|(h, _)| h)
+            .or_else(|| self.slider_rect().filter(inside).map(|_| Hit::Slider))
+            .or_else(|| self.toolbar_rect().filter(inside).map(|_| Hit::Panel))
             .or_else(|| self.palette_rect().filter(inside).map(|_| Hit::Panel))
     }
 
@@ -458,6 +637,17 @@ impl Overlay {
                     draw::selection_frame(&mut frame, &sel, 0.0, draw::frame_white(), self.scale);
                 }
                 self.render_toolbar(&mut frame);
+                let s = self.scale;
+                let clear = Paint {
+                    blend_mode: BlendMode::Clear,
+                    ..Paint::default()
+                };
+                for &(x, y, w, h) in &self.holes {
+                    let rect = Rect::from_xywh(x as f32 * s, y as f32 * s, w as f32 * s, h as f32 * s);
+                    if let Some(path) = rect.and_then(|r| rounded(r, 8.0 * s)) {
+                        frame.fill_path(&path, &clear, FillRule::Winding, Transform::identity(), None);
+                    }
+                }
             }
             Mode::Record => {
                 if let Some(ring) = self.ring {
@@ -492,16 +682,20 @@ impl Overlay {
     }
 
     fn render_toolbar(&self, frame: &mut PixmapMut) {
-        let (Some(bar), Some(buttons)) = (self.toolbar_rect(), self.button_rects()) else {
+        let (Some(bar), Some((buttons, seps))) = (self.toolbar_rect(), self.bar_layout()) else {
             return;
         };
         let s = self.scale;
         let id = Transform::identity();
         let bg = draw::paint(draw::rgba(32, 34, 37, 240));
         let active = draw::paint(draw::rgba(255, 255, 255, 40));
+        let faint = draw::paint(draw::rgba(255, 255, 255, 36));
         let current = draw::palette(self.color);
         if let Some(path) = rounded(bar, 8.0 * s) {
             frame.fill_path(&path, &bg, FillRule::Winding, id, None);
+        }
+        for sep in seps {
+            frame.fill_rect(sep, &faint, id, None);
         }
         for (hit, r) in buttons {
             let on = match hit {
@@ -513,6 +707,7 @@ impl Overlay {
             }
             let inset = 9.0 * s;
             let (x0, y0, x1, y1) = (r.left() + inset, r.top() + inset, r.right() - inset, r.bottom() - inset);
+            let (a, b) = (Point::from_xy(x0, y0), Point::from_xy(x1, y1));
             let icon = match hit {
                 Hit::Tool(Tool::Draw) => {
                     let n = 12;
@@ -528,14 +723,39 @@ impl Overlay {
                     )
                 }
                 Hit::Tool(Tool::Arrow) => Mark::Arrow(Point::from_xy(x0, y1), Point::from_xy(x1, y0), current),
-                Hit::Tool(Tool::Rect) => Mark::Rect(Point::from_xy(x0, y0), Point::from_xy(x1, y1), current),
-                Hit::Tool(Tool::Ellipse) => Mark::Ellipse(Point::from_xy(x0, y0), Point::from_xy(x1, y1), current),
+                Hit::Tool(Tool::Rect) => Mark::Rect(a, b, current),
+                Hit::Tool(Tool::Ellipse) => Mark::Ellipse(a, b, current),
+                Hit::Tool(Tool::Fill) => Mark::Fill(a, b, current),
+                Hit::Tool(Tool::Disc) => Mark::Disc(a, b, current),
+                Hit::Tool(Tool::Blur) => {
+                    blur_icon(frame, x0, y0, x1 - x0);
+                    continue;
+                }
                 _ => {
-                    swatch(frame, r, current, false, s);
+                    swatch(frame, r, current, true, s);
                     continue;
                 }
             };
             draw::draw_mark(frame, &icon, 2.5 * s, id, None);
+        }
+
+        if let (Some(panel), Some((x0, x1, y))) = (self.slider_rect(), self.slider_track()) {
+            if let Some(path) = rounded(panel, 8.0 * s) {
+                frame.fill_path(&path, &bg, FillRule::Winding, id, None);
+            }
+            let knob = x0 + self.blur * (x1 - x0);
+            let h = 4.0 * s;
+            if let Some(track) = Rect::from_ltrb(x0, y - h / 2.0, x1, y + h / 2.0).and_then(|r| rounded(r, h / 2.0)) {
+                frame.fill_path(&track, &faint, FillRule::Winding, id, None);
+            }
+            if let Some(fill) =
+                Rect::from_ltrb(x0, y - h / 2.0, knob.max(x0 + h), y + h / 2.0).and_then(|r| rounded(r, h / 2.0))
+            {
+                frame.fill_path(&fill, &draw::paint(Color::WHITE), FillRule::Winding, id, None);
+            }
+            if let Some(dot) = PathBuilder::from_circle(knob, y, 8.0 * s) {
+                frame.fill_path(&dot, &draw::paint(Color::WHITE), FillRule::Winding, id, None);
+            }
         }
 
         let (Some(panel), Some(swatches)) = (self.palette_rect(), self.swatch_rects()) else {
@@ -597,6 +817,21 @@ fn swatch(frame: &mut PixmapMut, r: Rect, color: Color, selected: bool, s: f32) 
             ..Stroke::default()
         };
         frame.stroke_path(&ring, &draw::paint(Color::WHITE), &stroke, id, None);
+    }
+}
+
+fn blur_icon(frame: &mut PixmapMut, x: f32, y: f32, size: f32) {
+    let cell = size / 3.0;
+    for (i, alpha) in [220, 90, 160, 120, 240, 70, 180, 100, 200].into_iter().enumerate() {
+        let (cx, cy) = (x + (i % 3) as f32 * cell, y + (i / 3) as f32 * cell);
+        if let Some(r) = Rect::from_xywh(cx, cy, cell, cell) {
+            frame.fill_rect(
+                r,
+                &draw::paint(draw::rgba(255, 255, 255, alpha)),
+                Transform::identity(),
+                None,
+            );
+        }
     }
 }
 

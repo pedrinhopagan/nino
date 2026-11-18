@@ -1,5 +1,6 @@
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, PixmapMut, Point, Rect, Stroke, Transform,
+    BlendMode, Color, FillRule, IntRect, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint,
+    Point, Rect, Stroke, Transform,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,6 +9,9 @@ pub enum Tool {
     Arrow,
     Rect,
     Ellipse,
+    Fill,
+    Disc,
+    Blur,
 }
 
 #[derive(Debug, Clone)]
@@ -16,6 +20,9 @@ pub enum Mark {
     Arrow(Point, Point, Color),
     Rect(Point, Point, Color),
     Ellipse(Point, Point, Color),
+    Fill(Point, Point, Color),
+    Disc(Point, Point, Color),
+    Blur(Point, Point, f32),
 }
 
 pub const PALETTE: [(u8, u8, u8); 6] = [
@@ -96,7 +103,13 @@ pub fn draw_mark(canvas: &mut PixmapMut, mark: &Mark, width: f32, transform: Tra
         ..Stroke::default()
     };
     let color = match mark {
-        Mark::Draw(_, c) | Mark::Arrow(_, _, c) | Mark::Rect(_, _, c) | Mark::Ellipse(_, _, c) => *c,
+        Mark::Blur(a, b, radius) => return blur(canvas, *a, *b, *radius as usize, transform, mask),
+        Mark::Draw(_, c)
+        | Mark::Arrow(_, _, c)
+        | Mark::Rect(_, _, c)
+        | Mark::Ellipse(_, _, c)
+        | Mark::Fill(_, _, c)
+        | Mark::Disc(_, _, c) => *c,
     };
     let p = paint(color);
     match mark {
@@ -159,6 +172,52 @@ pub fn draw_mark(canvas: &mut PixmapMut, mark: &Mark, width: f32, transform: Tra
         Mark::Ellipse(a, b, _) => {
             if let Some(path) = Sel::from_points(*a, *b).rect().and_then(PathBuilder::from_oval) {
                 canvas.stroke_path(&path, &p, &stroke, transform, mask);
+            }
+        }
+        Mark::Fill(a, b, _) => {
+            if let Some(rect) = Sel::from_points(*a, *b).rect() {
+                canvas.fill_rect(rect, &p, transform, mask);
+            }
+        }
+        Mark::Disc(a, b, _) => {
+            if let Some(path) = Sel::from_points(*a, *b).rect().and_then(PathBuilder::from_oval) {
+                canvas.fill_path(&path, &p, FillRule::Winding, transform, mask);
+            }
+        }
+        Mark::Blur(..) => {}
+    }
+}
+
+fn blur(canvas: &mut PixmapMut, a: Point, b: Point, radius: usize, transform: Transform, mask: Option<&Mask>) {
+    let mut corners = [a, b];
+    transform.map_points(&mut corners);
+    let (x, y, w, h) = Sel::from_points(corners[0], corners[1]).snapped(canvas.width(), canvas.height());
+    let Some(mut region) = IntRect::from_xywh(x as i32, y as i32, w, h).and_then(|r| canvas.as_ref().clone_rect(r))
+    else {
+        return;
+    };
+    let (w, h) = (w as usize, h as usize);
+    let mut tmp = vec![0u8; region.data().len()];
+    for _ in 0..3 {
+        blur_pass(region.data(), &mut tmp, h, w * 4, w, 4, radius);
+        blur_pass(&tmp, region.data_mut(), w, 4, h, w * 4, radius);
+    }
+    let paint = PixmapPaint {
+        blend_mode: BlendMode::Source,
+        ..PixmapPaint::default()
+    };
+    canvas.draw_pixmap(x as i32, y as i32, region.as_ref(), &paint, Transform::identity(), mask);
+}
+
+fn blur_pass(src: &[u8], dst: &mut [u8], lines: usize, line_step: usize, len: usize, step: usize, r: usize) {
+    let div = 2 * r as u32 + 1;
+    for line in 0..lines {
+        let at = |i: usize| line * line_step + i.min(len - 1) * step;
+        for c in 0..4 {
+            let mut sum = src[at(0) + c] as u32 * (r as u32 + 1) + (1..=r).map(|i| src[at(i) + c] as u32).sum::<u32>();
+            for i in 0..len {
+                dst[at(i) + c] = (sum / div) as u8;
+                sum = sum + src[at(i + r + 1) + c] as u32 - src[at(i.saturating_sub(r)) + c] as u32;
             }
         }
     }

@@ -18,38 +18,45 @@ Fork do [Ahri](https://github.com/juicerq/ahri) para KDE Plasma no Wayland, em R
 ## Como funciona
 
 1. <kbd>Win</kbd> <kbd>R</kbd> e arraste uma caixa. A gravação começa quando você solta o mouse.
-2. Durante a gravação:
-   - <kbd>Win</kbd> <kbd>N</kbd> abre uma anotação marcada com o tempo do vídeo.
-   - <kbd>Win</kbd> <kbd>Shift</kbd> <kbd>S</kbd> tira um print com as ferramentas do Ahri e abre uma anotação para ele.
-3. <kbd>Win</kbd> <kbd>R</kbd> de novo para parar.
+2. <kbd>Win</kbd> <kbd>N</kbd> (ou <kbd>Win</kbd> <kbd>Shift</kbd> <kbd>S</kbd>) pausa a gravação e abre a anotação daquele instante:
+   - a tela congela com o menu de desenho do Ahri e a área gravada já selecionada;
+   - o cartão de comentário e o histórico das anotações anteriores aparecem fora da área e ficam visíveis até você salvar;
+   - clique na tela para desenhar, clique no cartão para escrever;
+   - <kbd>Enter</kbd> salva a imagem, o comentário e o tempo e retoma a gravação.
+3. <kbd>Win</kbd> <kbd>R</kbd> de novo, ou <kbd>Esc</kbd> duas vezes seguidas, para parar. O primeiro <kbd>Esc</kbd> continua chegando ao app em uso.
 
-Ao parar, o clipboard recebe o vídeo, os prints e o `anotacoes.md` como arquivos, e o texto organizado das anotações:
+Durante a anotação, <kbd>Esc</kbd> duas vezes cancela a gravação inteira e apaga os arquivos dela.
+
+O tempo das anotações é o do vídeo: as pausas não contam. Para anotar só com texto, clique uma vez fora da área para tirar a seleção. Os cartões e o histórico nunca entram na imagem.
+
+Ao parar sem anotações, o clipboard recebe só o vídeo, como arquivo. Com anotações, recebe o vídeo e as imagens como arquivos, mais o texto da sessão com o caminho completo de cada um:
 
 ```text
-Pasta: /home/voce/Vídeos/Nino/2026-11-18_14-03-22
-Vídeo: gravacao.mp4
+Vídeo: /tmp/nino/2026-11-18_14-03-22/gravacao.mp4
 
-Anotação 1 - 02:32: "O **botão** salvar não responde"
-Print 1 - 02:50 (print-1.png): "Erro aparece aqui"
+Anotação 1 - 02:32 (/tmp/nino/2026-11-18_14-03-22/anotacao-1.png): "O **botão** salvar não responde"
 Anotação 2 - 03:11: "Ver o `console`"
 ```
 
-Colando num chat de IA que aceita arquivos, vão os arquivos. Colando num terminal ou editor, vai o texto. Tudo fica salvo em `~/Vídeos/Nino/`.
+Colando num chat de IA que aceita arquivos, vão os arquivos; num terminal ou editor, vai o texto. Tudo fica em `/tmp/nino/`, que some quando o computador reinicia.
 
 Fora de uma gravação, <kbd>Win</kbd> <kbd>Shift</kbd> <kbd>S</kbd> funciona como no Ahri: o print vai direto para o clipboard.
 
 ## Anotação
 
-<p align="center"><img src="docs/anotacao.png" width="640" alt="Cartão de anotação com negrito, código e tarefas"></p>
+<p align="center"><img src="docs/anotacao.png" width="800" alt="Cartão de anotação com negrito e tarefa, ao lado do histórico"></p>
 
-O campo usa o editor do composer do [T3 Code](https://github.com/pingdotgg/t3code), só com a formatação: `**negrito**`, `*itálico*`, `~~riscado~~`, `` `código` `` e `- [ ] tarefa`. Os marcadores aparecem quando o cursor está no trecho, e o texto sai em Markdown.
+O campo usa o editor do composer do [T3 Code](https://github.com/pingdotgg/t3code), só com a formatação. O Markdown vira formatação enquanto você digita: `# título`, `---`, `> citação`, `- lista`, `1. lista`, `- [ ] tarefa`, ```` ``` ```` para bloco de código, `**negrito**`, `*itálico*`, `~~riscado~~` e `` `código` ``. Os marcadores reaparecem quando o cursor entra no trecho, e o comentário sai em Markdown.
 
 | Tecla | Ação |
 | --- | --- |
-| <kbd>Enter</kbd> | Salvar |
+| <kbd>Enter</kbd> | Salvar e retomar a gravação |
 | <kbd>Shift</kbd> <kbd>Enter</kbd> | Nova linha |
-| <kbd>Ctrl</kbd> <kbd>Enter</kbd> | Salvar dentro de uma lista de tarefas |
-| <kbd>Esc</kbd> | Cancelar a anotação ou pular o comentário do print |
+| <kbd>Enter</kbd> numa lista | Novo item |
+| <kbd>Ctrl</kbd> <kbd>Enter</kbd> | Salvar de qualquer lugar |
+| <kbd>Esc</kbd> <kbd>Esc</kbd> | Cancelar a gravação e apagar os arquivos |
+
+No histórico, clique numa anotação para editá-la: a tela volta à imagem daquele momento, com os desenhos, e o comentário volta ao cartão. <kbd>Enter</kbd> salva a edição e retoma a gravação. O <kbd>×</kbd> apaga a anotação, e as seguintes são renumeradas.
 
 ## Print
 
@@ -60,8 +67,11 @@ O campo usa o editor do composer do [T3 Code](https://github.com/pingdotgg/t3cod
 | <kbd>1</kbd> ou <kbd>A</kbd> | Desenhar |
 | <kbd>2</kbd> ou <kbd>D</kbd> | Seta |
 | <kbd>3</kbd> ou <kbd>Q</kbd> | Quadrado |
-| <kbd>4</kbd> ou <kbd>E</kbd> | Círculo |
-| <kbd>5</kbd> | Abrir as cores, depois <kbd>1</kbd>–<kbd>6</kbd> para escolher |
+| <kbd>4</kbd> ou <kbd>W</kbd> | Quadrado pintado |
+| <kbd>5</kbd> ou <kbd>E</kbd> | Círculo |
+| <kbd>6</kbd> ou <kbd>R</kbd> | Círculo pintado |
+| <kbd>7</kbd> ou <kbd>B</kbd> | Desfocar uma área; o controle abaixo da barra ajusta a intensidade |
+| <kbd>8</kbd> | Abrir as cores, depois <kbd>1</kbd>–<kbd>6</kbd> para escolher |
 | <kbd>C</kbd> | Próxima cor |
 | <kbd>Ctrl</kbd> <kbd>Z</kbd> | Desfazer |
 | <kbd>Ctrl</kbd> <kbd>C</kbd> ou <kbd>Enter</kbd> | Copiar e fechar |

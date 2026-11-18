@@ -52,4 +52,10 @@ impl Recording {
             libc::kill(self.pid, libc::SIGINT);
         }
     }
+
+    pub fn toggle_pause(&self) {
+        unsafe {
+            libc::kill(self.pid, libc::SIGUSR2);
+        }
+    }
 }

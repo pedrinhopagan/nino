@@ -7,9 +7,9 @@ mod record;
 mod session;
 mod shortcuts;
 
-use std::io::Read;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -18,7 +18,10 @@ use smithay_client_toolkit::{
     dispatch2::Dispatch2,
     output::{OutputHandler, OutputState},
     reexports::{
-        calloop::{EventLoop, channel},
+        calloop::{
+            EventLoop, LoopHandle, channel,
+            timer::{TimeoutAction, Timer},
+        },
         calloop_wayland_source::WaylandSource,
         client::{
             Connection, Proxy, QueueHandle,
@@ -48,18 +51,33 @@ use clipboard::{Clipboard, Payload};
 use draw::{Sel, Tool};
 use overlay::{Mode, Outcome, Overlay};
 use record::Recording;
-use session::Session;
+use session::{Entry, Region, Session};
 use shortcuts::Action;
 
 pub enum Msg {
     Shortcut(Action),
     RecordingDone(Result<PathBuf, String>),
-    Note(usize, String),
+    Editor(u64, Option<String>),
     Fatal(String),
 }
 
 const BTN_LEFT: u32 = 0x110;
 const NAMESPACE: &str = "utility";
+const ESC_AGAIN: Duration = Duration::from_millis(1500);
+
+struct Annotation {
+    id: u64,
+    at: Duration,
+    editing: Option<usize>,
+    esc: Option<Instant>,
+    editor: Option<ChildStdin>,
+}
+
+struct PendingRecord {
+    global: (i32, i32, u32, u32),
+    region: Region,
+    screen: (i32, i32),
+}
 
 pub struct App {
     registry_state: RegistryState,
@@ -85,10 +103,12 @@ pub struct App {
     overlay: Option<Overlay>,
     ring: Option<Overlay>,
     opened_at: Option<(Instant, Duration)>,
-    pending_record: Option<(i32, i32, u32, u32)>,
+    pending_record: Option<PendingRecord>,
     recording: Option<Recording>,
     session: Option<Session>,
-    shot_at: Option<Duration>,
+    annotation: Option<Annotation>,
+    annotations: u64,
+    handle: LoopHandle<'static, App>,
     stopping: bool,
     fatal: Option<String>,
 }
@@ -98,10 +118,13 @@ pub struct Ud;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
-        Some("editor") => editor::run(
-            args.get(2).map_or("Anotação", String::as_str),
-            args.get(3).map_or("cancela", String::as_str),
-        ),
+        Some("editor") => {
+            let place: Option<Vec<i32>> = args[2..].iter().map(|a| a.parse().ok()).collect();
+            match place.and_then(|p| <[i32; 4]>::try_from(p).ok()) {
+                Some(place) => editor::run(place),
+                None => Err("uso: nino editor <x> <y> <largura> <altura>".into()),
+            }
+        }
         _ => run(),
     };
     if let Err(e) = result {
@@ -115,7 +138,7 @@ fn run() -> Result<(), String> {
     let (globals, queue) = registry_queue_init::<App>(&conn).map_err(|e| format!("registry: {e}"))?;
     let qh = queue.handle();
 
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().map_err(|e| e.to_string())?;
+    let mut event_loop: EventLoop<'static, App> = EventLoop::try_new().map_err(|e| e.to_string())?;
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|e| e.to_string())?;
@@ -162,7 +185,9 @@ fn run() -> Result<(), String> {
         pending_record: None,
         recording: None,
         session: None,
-        shot_at: None,
+        annotation: None,
+        annotations: 0,
+        handle: event_loop.handle(),
         stopping: false,
         fatal: None,
     };
@@ -182,26 +207,33 @@ impl App {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Shortcut(Action::Screenshot) => {
-                if self.overlay.is_none() && !self.editing() {
-                    self.open_shot();
+                if self.session.is_some() {
+                    self.open_annotation();
+                } else if self.overlay.is_none() {
+                    self.open_shot(KeyboardInteractivity::Exclusive, None);
                 }
             }
             Msg::Shortcut(Action::Record) => {
-                if let Some(rec) = &self.recording {
-                    if !self.stopping {
-                        self.stopping = true;
-                        rec.stop();
-                    }
+                if self.recording.is_some() {
+                    self.stop_recording();
                 } else if self.overlay.as_ref().is_some_and(|o| !o.is_shot()) {
                     self.close_overlay();
                 } else if self.overlay.is_none() && self.session.is_none() {
                     self.open_record();
                 }
             }
-            Msg::Shortcut(Action::Note) => self.open_note(),
+            Msg::Shortcut(Action::Note) => self.open_annotation(),
+            Msg::Shortcut(Action::Finish) => {
+                if self.annotation.is_some() {
+                    self.escape();
+                } else {
+                    self.stop_recording();
+                }
+            }
             Msg::RecordingDone(result) => {
                 self.recording = None;
                 self.stopping = false;
+                self.finish_keys(false);
                 self.close_ring();
                 match result {
                     Ok(path) => {
@@ -217,36 +249,75 @@ impl App {
                 }
                 self.finish_session();
             }
-            Msg::Note(id, text) => {
-                if let Some(session) = self.session.as_mut() {
-                    session.editing = false;
-                    session.set_text(id, text);
+            Msg::Editor(id, message) => {
+                if self.annotation.as_ref().is_some_and(|a| a.id == id) {
+                    match message {
+                        Some(message) => self.editor_message(&message),
+                        None => self.end_annotation(None),
+                    }
                 }
-                self.finish_session();
             }
             Msg::Fatal(e) => self.fatal = Some(e),
         }
     }
 
-    fn editing(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.editing)
-    }
-
-    fn open_note(&mut self) {
-        if self.recording.is_none() || self.overlay.is_some() || self.editing() {
+    fn open_annotation(&mut self) {
+        if self.recording.is_none() || self.stopping || self.overlay.is_some() || self.annotation.is_some() {
             return;
         }
         let Some(session) = self.session.as_mut() else { return };
-        let (id, title) = session.add_note(session.elapsed());
-        self.open_editor(id, &title, "cancela");
+        let at = session.elapsed();
+        if session.pause()
+            && let Some(rec) = &self.recording
+        {
+            rec.toggle_pause();
+        }
+        let state = session.editor_state(at);
+        let (x, y, w, h) = session.region;
+        let screen = session.screen;
+        let panels = panels(session.region, screen, !session.entries.is_empty());
+        self.annotations += 1;
+        let id = self.annotations;
+        self.annotation = Some(Annotation {
+            id,
+            at,
+            editing: None,
+            esc: None,
+            editor: None,
+        });
+        let sel = Sel {
+            x: x as f32,
+            y: y as f32,
+            w: w as f32,
+            h: h as f32,
+        };
+        self.open_shot(KeyboardInteractivity::OnDemand, Some(sel));
+        let Some(ov) = self.overlay.as_mut() else {
+            self.end_annotation(None);
+            return;
+        };
+        let region = self.compositor.wl_compositor().create_region(&self.qh, Ud);
+        region.add(0, 0, screen.0, screen.1);
+        for &(x, y, w, h) in &panels {
+            region.subtract(x, y, w, h);
+        }
+        ov.layer.wl_surface().set_input_region(Some(&region));
+        region.destroy();
+        ov.holes = panels.clone();
+        let (left, top, _, height) = panels[0];
+        let right = panels.iter().map(|&(x, _, w, _)| x + w).max().unwrap_or(left);
+        let editor = self.spawn_editor(id, &state, [left, top, right - left, height]);
+        if let Some(annotation) = self.annotation.as_mut() {
+            annotation.editor = editor;
+        }
     }
 
-    fn open_editor(&mut self, id: usize, title: &str, esc: &str) {
-        let Some(session) = self.session.as_mut() else { return };
+    fn spawn_editor(&self, id: u64, state: &str, place: [i32; 4]) -> Option<ChildStdin> {
         let child = std::env::current_exe().and_then(|exe| {
             Command::new(exe)
-                .args(["editor", title, esc])
-                .stdin(Stdio::null())
+                .arg("editor")
+                .args(place.map(|v| v.to_string()))
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
         });
@@ -255,26 +326,180 @@ impl App {
             Err(e) => {
                 eprintln!("nino: editor: {e}");
                 self.notify("Falha ao abrir a anotação", &e.to_string());
-                return;
+                return None;
             }
         };
-        session.editing = true;
+        let mut stdin = child.stdin.take();
+        if let Some(pipe) = stdin.as_mut()
+            && let Err(e) = writeln!(pipe, "{state}")
+        {
+            eprintln!("nino: editor: {e}");
+        }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_string(&mut text);
+            if let Some(stdout) = child.stdout.take() {
+                for message in std::io::BufReader::new(stdout).split(0).map_while(Result::ok) {
+                    let _ = tx.send(Msg::Editor(id, Some(String::from_utf8_lossy(&message).into_owned())));
+                }
             }
             let _ = child.wait();
-            let _ = tx.send(Msg::Note(id, text.trim().to_string()));
+            let _ = tx.send(Msg::Editor(id, None));
         });
+        stdin
+    }
+
+    fn send_editor(&mut self, script: &str) -> bool {
+        self.annotation
+            .as_mut()
+            .and_then(|a| a.editor.as_mut())
+            .is_some_and(|stdin| writeln!(stdin, "{script}").and_then(|_| stdin.flush()).is_ok())
+    }
+
+    fn editor_message(&mut self, message: &str) {
+        if let Some(text) = message.strip_prefix("submit\n") {
+            self.end_annotation(Some(text.trim().to_string()));
+            return;
+        }
+        if message == "esc" {
+            self.escape();
+            return;
+        }
+        let Some((command, n)) = message.split_once(' ') else {
+            return;
+        };
+        let Some(i) = n.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) else {
+            return;
+        };
+        let (Some(session), Some(annotation)) = (self.session.as_mut(), self.annotation.as_mut()) else {
+            return;
+        };
+        if i >= session.entries.len() {
+            return;
+        }
+        match command {
+            "edit" => {
+                annotation.editing = Some(i);
+                if let (Some(ov), Some(doc)) = (self.overlay.as_mut(), session.entries[i].doc.as_ref()) {
+                    ov.load(doc);
+                    let qh = self.qh.clone();
+                    self.redraw(&qh);
+                }
+            }
+            "delete" => {
+                session.entries.remove(i);
+                annotation.editing = match annotation.editing {
+                    Some(e) if e == i => None,
+                    Some(e) if e > i => Some(e - 1),
+                    editing => editing,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn request_submit(&mut self) {
+        if !self.send_editor("ninoSubmit()") {
+            self.end_annotation(Some(String::new()));
+        }
+    }
+
+    fn escape(&mut self) {
+        let Some(annotation) = self.annotation.as_mut() else {
+            return;
+        };
+        if annotation.esc.is_some_and(|t| t.elapsed() < ESC_AGAIN) {
+            self.cancel_recording();
+            return;
+        }
+        annotation.esc = Some(Instant::now());
+        self.send_editor("ninoArm()");
+    }
+
+    fn cancel_recording(&mut self) {
+        self.annotation = None;
+        self.close_overlay();
+        if let Some(session) = self.session.as_mut() {
+            session.cancelled = true;
+        }
+        self.stop_recording();
+        self.finish_session();
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(rec) = &self.recording
+            && !self.stopping
+        {
+            self.stopping = true;
+            rec.stop();
+        }
+    }
+
+    fn finish_keys(&self, on: bool) {
+        if let Err(e) = zbus::block_on(shortcuts::set_finish(&self.dbus, on)) {
+            eprintln!("nino: finish shortcut: {e}");
+        }
+    }
+
+    fn end_annotation(&mut self, result: Option<String>) {
+        let Some(annotation) = self.annotation.take() else {
+            return;
+        };
+        drop(annotation.editor);
+        if let (Some(text), Some(session)) = (result, self.session.as_mut()) {
+            let overlay = self.overlay.as_ref();
+            let png = overlay
+                .filter(|o| o.has_selection())
+                .and_then(Overlay::export)
+                .and_then(|image| draw::encode_png(&image).map_err(|e| eprintln!("nino: png: {e}")).ok());
+            let doc = overlay.and_then(Overlay::doc);
+            match annotation.editing.and_then(|i| session.entries.get_mut(i)) {
+                Some(entry) => {
+                    entry.text = text;
+                    entry.png = png;
+                    entry.doc = doc;
+                }
+                None if png.is_some() || !text.is_empty() => session.entries.push(Entry {
+                    at: annotation.at,
+                    text,
+                    png,
+                    doc,
+                }),
+                None => {}
+            }
+        }
+        self.close_overlay();
+        let resume = Timer::from_duration(Duration::from_millis(150));
+        let scheduled = self.handle.insert_source(resume, |_, _, app| {
+            app.resume_recording();
+            TimeoutAction::Drop
+        });
+        if scheduled.is_err() {
+            self.resume_recording();
+        }
+        self.finish_session();
+    }
+
+    fn resume_recording(&mut self) {
+        if self.annotation.is_some() {
+            return;
+        }
+        if let (Some(rec), Some(session)) = (&self.recording, self.session.as_mut())
+            && session.resume()
+        {
+            rec.toggle_pause();
+        }
     }
 
     fn finish_session(&mut self) {
-        if self.recording.is_some() || self.editing() {
+        if self.recording.is_some() || self.annotation.is_some() {
             return;
         }
         let Some(session) = self.session.take() else { return };
+        if session.cancelled {
+            let _ = std::fs::remove_dir_all(&session.dir);
+            eprintln!("nino: recording cancelled");
+            return;
+        }
         let finished = match session.finish() {
             Ok(finished) => finished,
             Err(e) => {
@@ -288,35 +513,39 @@ impl App {
             .iter()
             .map(|p| format!("file://{}", encode_path(p)))
             .collect();
-        if uris.is_empty() {
-            return;
-        }
-        let mut entries = vec![
-            ("text/uri-list", format!("{}\r\n", uris.join("\r\n")).into_bytes()),
-            (
+        let mut entries = Vec::new();
+        if !uris.is_empty() {
+            entries.push(("text/uri-list", format!("{}\r\n", uris.join("\r\n")).into_bytes()));
+            entries.push((
                 "x-special/gnome-copied-files",
                 format!("copy\n{}", uris.join("\n")).into_bytes(),
-            ),
-        ];
-        if let Some(notes) = finished.notes {
-            entries.push(("text/plain;charset=utf-8", notes.clone().into_bytes()));
-            entries.push(("text/plain", notes.into_bytes()));
+            ));
+        }
+        if let Some(text) = finished.text {
+            entries.push(("text/plain;charset=utf-8", text.clone().into_bytes()));
+            entries.push(("text/plain", text.into_bytes()));
+        }
+        if entries.is_empty() {
+            return;
         }
         self.set_clipboard(Payload { entries });
         eprintln!("nino: copied {} files", uris.len());
     }
 
-    fn open_shot(&mut self) {
-        self.shot_at = self.session.as_ref().map(Session::elapsed);
+    fn open_shot(&mut self, keyboard: KeyboardInteractivity, selection: Option<Sel>) {
         let started = Instant::now();
-        let (layer, viewport) = self.new_layer();
+        let (layer, viewport) = self.new_layer(keyboard);
         if let Err(e) = self.wayland.flush() {
             eprintln!("nino: wayland flush: {e}");
         }
         match capture::capture_active_screen(&self.dbus) {
             Ok(shot) => {
                 self.opened_at = Some((started, started.elapsed()));
-                self.overlay = Some(Overlay::new(layer, viewport, Mode::Shot { shot }));
+                let overlay = Overlay::new(layer, viewport, Mode::Shot { shot });
+                self.overlay = Some(match selection {
+                    Some(sel) => overlay.with_selection(sel),
+                    None => overlay,
+                });
             }
             Err(e) => {
                 viewport.destroy();
@@ -329,12 +558,12 @@ impl App {
 
     fn open_record(&mut self) {
         let started = Instant::now();
-        let (layer, viewport) = self.new_layer();
+        let (layer, viewport) = self.new_layer(KeyboardInteractivity::Exclusive);
         self.opened_at = Some((started, Duration::ZERO));
         self.overlay = Some(Overlay::new(layer, viewport, Mode::Record));
     }
 
-    fn new_layer(&self) -> (LayerSurface, WpViewport) {
+    fn new_layer(&self, keyboard: KeyboardInteractivity) -> (LayerSurface, WpViewport) {
         let qh = &self.qh;
         let surface = self.compositor.create_surface(qh);
         let viewport = self.viewporter.get_viewport(&surface, qh, Ud);
@@ -343,7 +572,7 @@ impl App {
             .create_layer_surface(qh, surface, Layer::Overlay, Some(NAMESPACE), None);
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.set_keyboard_interactivity(keyboard);
         layer.commit();
         (layer, viewport)
     }
@@ -401,7 +630,9 @@ impl App {
                 let qh = self.qh.clone();
                 self.redraw(&qh);
             }
+            Outcome::Close if self.annotation.is_some() => self.escape(),
             Outcome::Close => self.close_overlay(),
+            Outcome::Copy if self.annotation.is_some() => self.request_submit(),
             Outcome::Copy => self.copy_shot(),
             Outcome::Record(sel) => self.start_recording(sel),
         }
@@ -420,17 +651,6 @@ impl App {
                 return;
             }
         };
-        if let Some(session) = self.session.as_mut() {
-            let at = self.shot_at.take().unwrap_or_else(|| session.elapsed());
-            match session.add_print(at, &png) {
-                Ok((id, title)) => self.open_editor(id, &title, "pula"),
-                Err(e) => {
-                    eprintln!("nino: print: {e}");
-                    self.notify("Falha ao salvar o print", &e);
-                }
-            }
-            return;
-        }
         let size = png.len();
         self.set_clipboard(Payload {
             entries: vec![("image/png", png)],
@@ -482,13 +702,18 @@ impl App {
         region.destroy();
         ov.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-        self.pending_record = Some((pos.0 + x0, pos.1 + y0, w as u32, h as u32));
+        self.pending_record = Some(PendingRecord {
+            global: (pos.0 + x0, pos.1 + y0, w as u32, h as u32),
+            region: (x0, y0, w, h),
+            screen,
+        });
         let qh = self.qh.clone();
         self.redraw(&qh);
     }
 
-    fn begin_recording(&mut self, (x, y, w, h): (i32, i32, u32, u32)) {
-        let started = Session::new().and_then(|session| {
+    fn begin_recording(&mut self, pending: PendingRecord) {
+        let (x, y, w, h) = pending.global;
+        let started = Session::new(pending.region, pending.screen).and_then(|session| {
             let rec = Recording::start(session.video_path(), x, y, w, h, self.tx.clone())
                 .inspect_err(|_| _ = std::fs::remove_dir(&session.dir))?;
             Ok((session, rec))
@@ -499,6 +724,7 @@ impl App {
                 self.session = Some(session);
                 self.recording = Some(rec);
                 self.ring = self.overlay.take();
+                self.finish_keys(true);
             }
             Err(e) => {
                 eprintln!("nino: {e}");
@@ -711,7 +937,10 @@ impl KeyboardHandler for App {
             Keysym::a | Keysym::A if !ctrl => ov.set_tool(Tool::Draw),
             Keysym::d | Keysym::D if !ctrl => ov.set_tool(Tool::Arrow),
             Keysym::q | Keysym::Q if !ctrl => ov.set_tool(Tool::Rect),
+            Keysym::w | Keysym::W if !ctrl => ov.set_tool(Tool::Fill),
             Keysym::e | Keysym::E if !ctrl => ov.set_tool(Tool::Ellipse),
+            Keysym::r | Keysym::R if !ctrl => ov.set_tool(Tool::Disc),
+            Keysym::b | Keysym::B if !ctrl => ov.set_tool(Tool::Blur),
             k if !ctrl && ov.is_shot() && (Keysym::_1.raw()..=Keysym::_9.raw()).contains(&k.raw()) => {
                 ov.number((k.raw() - Keysym::_0.raw()) as usize)
             }
@@ -827,6 +1056,36 @@ impl ProvidesRegistryState for App {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+fn panels((_, y, _, h): Region, (screen_w, screen_h): (i32, i32), history: bool) -> Vec<Region> {
+    const BAR: i32 = 56;
+    const GAP: i32 = 12;
+    const MIN: i32 = 150;
+    let (top, bottom) = if y + h + BAR <= screen_h {
+        (y, y + h + BAR)
+    } else if y >= BAR {
+        (y - BAR, y + h)
+    } else {
+        (y, y + h)
+    };
+    let below = screen_h - bottom - 2 * GAP;
+    let above = top - 2 * GAP;
+    let (top, height) = if below >= editor::HEIGHT || (below >= above && below >= MIN) {
+        (bottom + GAP, below.min(editor::HEIGHT))
+    } else if above >= MIN {
+        let height = above.min(editor::HEIGHT);
+        (top - GAP - height, height)
+    } else {
+        (screen_h - 24 - editor::HEIGHT, editor::HEIGHT)
+    };
+    let width = editor::CARD + if history { editor::GAP + editor::HISTORY } else { 0 };
+    let left = ((screen_w - width) / 2).max(0);
+    let mut out = vec![(left, top, editor::CARD, height)];
+    if history {
+        out.push((left + editor::CARD + editor::GAP, top, editor::HISTORY, height));
+    }
+    out
+}
 
 fn align_up(v: i32, to: i32) -> i32 {
     (v + to - 1) / to * to

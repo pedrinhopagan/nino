@@ -12,6 +12,8 @@ const SHIFT: i32 = 0x0200_0000;
 const KEY_N: i32 = 0x4E;
 const KEY_R: i32 = 0x52;
 const KEY_S: i32 = 0x53;
+const KEY_ESC: i32 = 0x0100_0000;
+const FINISH: [&str; 4] = [COMPONENT, "finish", COMPONENT_NAME, "Concluir a gravação"];
 const SET_PRESENT_NO_AUTOLOADING: u32 = 2 | 4;
 const TAKEOVER_FROM: &str = "org.kde.spectacle.desktop";
 
@@ -20,6 +22,7 @@ pub enum Action {
     Screenshot,
     Record,
     Note,
+    Finish,
 }
 
 const ACTIONS: [(Action, &str, &str, i32); 3] = [
@@ -48,6 +51,8 @@ async fn run(tx: &Sender<Msg>) -> zbus::Result<()> {
     for (_, name, friendly, key) in ACTIONS {
         register(&conn, name, friendly, key).await?;
     }
+    call(&conn, "doRegister", &(&FINISH[..],)).await?;
+    set_finish(&conn, false).await?;
 
     let path: OwnedObjectPath = call(&conn, "getComponent", &(COMPONENT,)).await?.body().deserialize()?;
     let rule = MatchRule::builder()
@@ -66,8 +71,12 @@ async fn run(tx: &Sender<Msg>) -> zbus::Result<()> {
         if component != COMPONENT {
             continue;
         }
-        if let Some((action, ..)) = ACTIONS.iter().find(|(_, n, ..)| *n == name)
-            && tx.send(Msg::Shortcut(*action)).is_err()
+        let action = match name.as_str() {
+            "finish" => Some(Action::Finish),
+            name => ACTIONS.iter().find(|(_, n, ..)| *n == name).map(|(a, ..)| *a),
+        };
+        if let Some(action) = action
+            && tx.send(Msg::Shortcut(action)).is_err()
         {
             break;
         }
@@ -103,6 +112,21 @@ async fn set(conn: &Connection, id: &[&str], key: i32) -> zbus::Result<bool> {
         .body()
         .deserialize()?;
     Ok(keys == [key])
+}
+
+pub async fn set_finish(conn: &Connection, on: bool) -> zbus::Result<()> {
+    let keys: Vec<(Vec<i32>,)> = if on {
+        vec![(vec![KEY_ESC, KEY_ESC, 0, 0],)]
+    } else {
+        Vec::new()
+    };
+    call(
+        conn,
+        "setShortcutKeys",
+        &(&FINISH[..], keys, SET_PRESENT_NO_AUTOLOADING),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn call<B>(conn: &Connection, method: &str, body: &B) -> zbus::Result<zbus::Message>
