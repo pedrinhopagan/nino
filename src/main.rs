@@ -508,27 +508,33 @@ impl App {
                 return;
             }
         };
+        if let Some(text) = finished.text {
+            self.set_clipboard(Payload {
+                entries: vec![
+                    ("text/plain;charset=utf-8", text.clone().into_bytes()),
+                    ("text/plain", text.into_bytes()),
+                ],
+            });
+            eprintln!("nino: copied session text");
+            return;
+        }
         let uris: Vec<String> = finished
             .files
             .iter()
             .map(|p| format!("file://{}", encode_path(p)))
             .collect();
-        let mut entries = Vec::new();
-        if !uris.is_empty() {
-            entries.push(("text/uri-list", format!("{}\r\n", uris.join("\r\n")).into_bytes()));
-            entries.push((
-                "x-special/gnome-copied-files",
-                format!("copy\n{}", uris.join("\n")).into_bytes(),
-            ));
-        }
-        if let Some(text) = finished.text {
-            entries.push(("text/plain;charset=utf-8", text.clone().into_bytes()));
-            entries.push(("text/plain", text.into_bytes()));
-        }
-        if entries.is_empty() {
+        if uris.is_empty() {
             return;
         }
-        self.set_clipboard(Payload { entries });
+        self.set_clipboard(Payload {
+            entries: vec![
+                ("text/uri-list", format!("{}\r\n", uris.join("\r\n")).into_bytes()),
+                (
+                    "x-special/gnome-copied-files",
+                    format!("copy\n{}", uris.join("\n")).into_bytes(),
+                ),
+            ],
+        });
         eprintln!("nino: copied {} files", uris.len());
     }
 

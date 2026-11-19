@@ -29,7 +29,7 @@ Durante a anotação, <kbd>Esc</kbd> duas vezes cancela a gravação inteira e a
 
 O tempo das anotações é o do vídeo: as pausas não contam. Para anotar só com texto, clique uma vez fora da área para tirar a seleção. Os cartões e o histórico nunca entram na imagem.
 
-Ao parar sem anotações, o clipboard recebe só o vídeo, como arquivo. Com anotações, recebe o vídeo e as imagens como arquivos, mais o texto da sessão com o caminho completo de cada um:
+Ao parar sem nenhum comentário, o clipboard recebe os arquivos: o vídeo e os prints das anotações. Se alguma anotação tiver comentário, recebe só o texto da sessão, com o caminho completo de cada arquivo:
 
 ```text
 Vídeo: /tmp/nino/2026-11-18_14-03-22/gravacao.mp4
@@ -38,7 +38,7 @@ Anotação 1 - 02:32 (/tmp/nino/2026-11-18_14-03-22/anotacao-1.png): "O **botão
 Anotação 2 - 03:11: "Ver o `console`"
 ```
 
-Colando num chat de IA que aceita arquivos, vão os arquivos; num terminal ou editor, vai o texto. Tudo fica em `/tmp/nino/`, que some quando o computador reinicia.
+Tudo fica em `/tmp/nino/`, que some quando o computador reinicia.
 
 Fora de uma gravação, <kbd>Win</kbd> <kbd>Shift</kbd> <kbd>S</kbd> funciona como no Ahri: o print vai direto para o clipboard.
 
@@ -72,6 +72,7 @@ No histórico, clique numa anotação para editá-la: a tela volta à imagem daq
 | <kbd>6</kbd> ou <kbd>R</kbd> | Círculo pintado |
 | <kbd>7</kbd> ou <kbd>B</kbd> | Desfocar uma área; o controle abaixo da barra ajusta a intensidade |
 | <kbd>8</kbd> | Abrir as cores, depois <kbd>1</kbd>–<kbd>6</kbd> para escolher |
+| <kbd>8</kbd> <kbd>7</kbd> | Conta-gotas: clique em qualquer ponto da tela para usar aquela cor |
 | <kbd>C</kbd> | Próxima cor |
 | <kbd>Ctrl</kbd> <kbd>Z</kbd> | Desfazer |
 | <kbd>Ctrl</kbd> <kbd>C</kbd> ou <kbd>Enter</kbd> | Copiar e fechar |

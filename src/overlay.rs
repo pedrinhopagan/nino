@@ -54,6 +54,7 @@ enum Hit {
     Tool(Tool),
     ColorButton,
     Swatch(usize),
+    Picker,
     Slider,
     Panel,
 }
@@ -112,6 +113,8 @@ pub struct Overlay {
     marks: Vec<Mark>,
     tool: Tool,
     color: usize,
+    picked: Option<Color>,
+    picking: bool,
     blur: f32,
     palette_open: bool,
     pub frame_pending: bool,
@@ -138,6 +141,8 @@ impl Overlay {
             marks: Vec::new(),
             tool: Tool::Draw,
             color: 0,
+            picked: None,
+            picking: false,
             blur: 0.35,
             palette_open: false,
             frame_pending: false,
@@ -196,12 +201,16 @@ impl Overlay {
                 Hit::Tool(tool) => self.set_tool(tool),
                 Hit::ColorButton => self.toggle_palette(),
                 Hit::Swatch(i) => self.number(i + 1),
+                Hit::Picker => self.toggle_picking(),
                 Hit::Slider => {
                     self.drag = Drag::Slider;
                     self.slide(p.x)
                 }
                 Hit::Panel => Outcome::Nothing,
             };
+        }
+        if self.picking {
+            return self.pick(p);
         }
         self.palette_open = false;
         if let Some((sel, edges)) = self.edges_at(p) {
@@ -210,12 +219,12 @@ impl Overlay {
         }
         if self.is_shot() && self.sel.is_some_and(|s| s.contains(p)) {
             self.drag = Drag::Marking(match self.tool {
-                Tool::Draw => Mark::Draw(vec![p], draw::palette(self.color)),
-                Tool::Arrow => Mark::Arrow(p, p, draw::palette(self.color)),
-                Tool::Rect => Mark::Rect(p, p, draw::palette(self.color)),
-                Tool::Ellipse => Mark::Ellipse(p, p, draw::palette(self.color)),
-                Tool::Fill => Mark::Fill(p, p, draw::palette(self.color)),
-                Tool::Disc => Mark::Disc(p, p, draw::palette(self.color)),
+                Tool::Draw => Mark::Draw(vec![p], self.current()),
+                Tool::Arrow => Mark::Arrow(p, p, self.current()),
+                Tool::Rect => Mark::Rect(p, p, self.current()),
+                Tool::Ellipse => Mark::Ellipse(p, p, self.current()),
+                Tool::Fill => Mark::Fill(p, p, self.current()),
+                Tool::Disc => Mark::Disc(p, p, self.current()),
                 Tool::Blur => Mark::Blur(p, p, self.blur_radius()),
             });
         } else {
@@ -372,8 +381,13 @@ impl Overlay {
         if self.palette_open {
             if n >= 1 && n <= draw::PALETTE.len() {
                 self.color = n - 1;
+                self.picked = None;
+                self.picking = false;
                 self.palette_open = false;
                 return Outcome::Redraw;
+            }
+            if n == draw::PALETTE.len() + 1 {
+                return self.toggle_picking();
             }
             return Outcome::Nothing;
         }
@@ -392,6 +406,28 @@ impl Overlay {
 
     pub fn next_color(&mut self) -> Outcome {
         self.color = (self.color + 1) % draw::PALETTE.len();
+        self.picked = None;
+        Outcome::Redraw
+    }
+
+    fn current(&self) -> Color {
+        self.picked.unwrap_or_else(|| draw::palette(self.color))
+    }
+
+    fn toggle_picking(&mut self) -> Outcome {
+        self.picking = !self.picking;
+        Outcome::Redraw
+    }
+
+    fn pick(&mut self, p: Point) -> Outcome {
+        let Mode::Shot { shot } = &self.mode else {
+            return Outcome::Nothing;
+        };
+        if let Some(px) = shot.pixel(p.x as u32, p.y as u32) {
+            self.picked = Some(Color::from_rgba8(px.red(), px.green(), px.blue(), 255));
+        }
+        self.picking = false;
+        self.palette_open = false;
         Outcome::Redraw
     }
 
@@ -539,9 +575,9 @@ impl Overlay {
             return None;
         }
         let s = self.scale;
-        let n = draw::PALETTE.len() as f32;
+        let n = draw::PALETTE.len() as f32 + 1.0;
         let panel = self.panel_below((BTN * n + PAD * (n + 1.0)) * s)?;
-        (0..draw::PALETTE.len())
+        (0..=draw::PALETTE.len())
             .map(|i| {
                 let r = Rect::from_xywh(
                     panel.x() + (PAD + i as f32 * (BTN + PAD)) * s,
@@ -549,7 +585,12 @@ impl Overlay {
                     BTN * s,
                     BTN * s,
                 )?;
-                Some((Hit::Swatch(i), r))
+                let hit = if i == draw::PALETTE.len() {
+                    Hit::Picker
+                } else {
+                    Hit::Swatch(i)
+                };
+                Some((hit, r))
             })
             .collect()
     }
@@ -690,7 +731,7 @@ impl Overlay {
         let bg = draw::paint(draw::rgba(32, 34, 37, 240));
         let active = draw::paint(draw::rgba(255, 255, 255, 40));
         let faint = draw::paint(draw::rgba(255, 255, 255, 36));
-        let current = draw::palette(self.color);
+        let current = self.current();
         if let Some(path) = rounded(bar, 8.0 * s) {
             frame.fill_path(&path, &bg, FillRule::Winding, id, None);
         }
@@ -765,8 +806,19 @@ impl Overlay {
             frame.fill_path(&path, &bg, FillRule::Winding, id, None);
         }
         for (hit, r) in swatches {
-            if let Hit::Swatch(i) = hit {
-                swatch(frame, r, draw::palette(i), i == self.color, s);
+            match hit {
+                Hit::Swatch(i) => swatch(frame, r, draw::palette(i), i == self.color && self.picked.is_none(), s),
+                _ => {
+                    if self.picking
+                        && let Some(path) = rounded(r, 6.0 * s)
+                    {
+                        frame.fill_path(&path, &active, FillRule::Winding, id, None);
+                    }
+                    if let Some(color) = self.picked {
+                        swatch(frame, r, color, true, s);
+                    }
+                    dropper_icon(frame, r, s);
+                }
             }
         }
     }
@@ -817,6 +869,41 @@ fn swatch(frame: &mut PixmapMut, r: Rect, color: Color, selected: bool, s: f32) 
             ..Stroke::default()
         };
         frame.stroke_path(&ring, &draw::paint(Color::WHITE), &stroke, id, None);
+    }
+}
+
+fn dropper_icon(frame: &mut PixmapMut, r: Rect, s: f32) {
+    let id = Transform::identity();
+    let white = draw::paint(Color::WHITE);
+    let (x0, y0, x1, y1) = (
+        r.left() + 11.0 * s,
+        r.top() + 11.0 * s,
+        r.right() - 11.0 * s,
+        r.bottom() - 11.0 * s,
+    );
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0, y1);
+    pb.line_to(x1 - 4.0 * s, y0 + 4.0 * s);
+    if let Some(path) = pb.finish() {
+        let stroke = Stroke {
+            width: 3.0 * s,
+            line_cap: tiny_skia::LineCap::Round,
+            ..Stroke::default()
+        };
+        frame.stroke_path(
+            &path,
+            &draw::paint(draw::rgba(0, 0, 0, 120)),
+            &Stroke {
+                width: 5.0 * s,
+                ..stroke.clone()
+            },
+            id,
+            None,
+        );
+        frame.stroke_path(&path, &white, &stroke, id, None);
+    }
+    if let Some(bulb) = PathBuilder::from_circle(x1 - 3.0 * s, y0 + 3.0 * s, 4.5 * s) {
+        frame.fill_path(&bulb, &white, FillRule::Winding, id, None);
     }
 }
 

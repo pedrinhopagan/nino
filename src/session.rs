@@ -91,9 +91,6 @@ impl Session {
 
     pub fn finish(self) -> Result<Finished, String> {
         let mut files: Vec<PathBuf> = self.video.iter().cloned().collect();
-        if self.entries.is_empty() {
-            return Ok(Finished { files, text: None });
-        }
         let mut out = String::new();
         if let Some(video) = &self.video {
             let _ = writeln!(out, "Vídeo: {}\n", video.display());
@@ -112,7 +109,8 @@ impl Session {
                 let _ = writeln!(out, ": \"{}\"", entry.text);
             }
         }
-        Ok(Finished { files, text: Some(out) })
+        let text = self.entries.iter().any(|e| !e.text.is_empty()).then_some(out);
+        Ok(Finished { files, text })
     }
 }
 
