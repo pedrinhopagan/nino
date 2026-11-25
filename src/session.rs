@@ -33,7 +33,7 @@ pub struct Entry {
 impl Session {
     pub fn new(region: Region, screen: (i32, i32)) -> Result<Self, String> {
         let name = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-        let dir = std::env::temp_dir().join("nino").join(name);
+        let dir = root().join(name);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Self {
             dir,
@@ -48,8 +48,12 @@ impl Session {
         })
     }
 
-    pub fn video_path(&self) -> PathBuf {
-        self.dir.join("gravacao.mp4")
+    pub fn trim(&mut self, from: f32, to: f32) {
+        let (from, to) = (Duration::from_secs_f32(from.max(0.0)), Duration::from_secs_f32(to.max(from)));
+        let len = to.saturating_sub(from);
+        for entry in &mut self.entries {
+            entry.at = entry.at.saturating_sub(from).min(len);
+        }
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -112,6 +116,10 @@ impl Session {
         let text = self.entries.iter().any(|e| !e.text.is_empty()).then_some(out);
         Ok(Finished { files, text })
     }
+}
+
+pub fn root() -> PathBuf {
+    std::env::temp_dir().join("nino")
 }
 
 fn clock(at: Duration) -> String {

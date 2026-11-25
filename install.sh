@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 missing=()
 command -v gpu-screen-recorder >/dev/null || missing+=(gpu-screen-recorder)
+command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || missing+=(ffmpeg)
 pkg-config --exists gtk-layer-shell-0 || missing+=(gtk-layer-shell)
 pkg-config --exists webkit2gtk-4.1 || missing+=(webkit2gtk-4.1)
 if ((${#missing[@]})); then
@@ -17,6 +18,7 @@ if ! command -v bun >/dev/null; then
 fi
 
 (cd editor && bun install --frozen-lockfile && bun run build)
+
 cargo build --release
 
 bin="$HOME/.local/bin/nino"
@@ -38,6 +40,8 @@ Icon=nino
 NoDisplay=true
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 DESKTOP
+
+kpackagetool6 -t Plasma/Applet -u plasma >/dev/null 2>&1 || kpackagetool6 -t Plasma/Applet -i plasma
 
 kbuildsycoca6 >/dev/null 2>&1 || true
 systemctl --user daemon-reload

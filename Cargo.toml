@@ -8,6 +8,7 @@ chrono = "0.4.45"
 gtk = "0.18"
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 javascriptcore-rs = "1.1"
+fontdue = "0.9.5"
 libc = "0.2.191"
 png = "0.18"
 smithay-client-toolkit = "0.21"

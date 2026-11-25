@@ -2,13 +2,15 @@ mod capture;
 mod clipboard;
 mod draw;
 mod editor;
+mod media;
 mod overlay;
 mod record;
+mod review;
 mod session;
 mod shortcuts;
+mod text;
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -52,12 +54,14 @@ use draw::{Sel, Tool};
 use overlay::{Mode, Outcome, Overlay};
 use record::Recording;
 use session::{Entry, Region, Session};
+use review::{Panel, Review};
 use shortcuts::Action;
 
 pub enum Msg {
     Shortcut(Action),
-    RecordingDone(Result<PathBuf, String>),
+    RecordingDone(Result<record::Recorded, String>),
     Editor(u64, Option<String>),
+    Media(media::Event),
     Fatal(String),
 }
 
@@ -109,7 +113,11 @@ pub struct App {
     annotation: Option<Annotation>,
     annotations: u64,
     handle: LoopHandle<'static, App>,
+    record_output: Option<wl_output::WlOutput>,
+    audio_probe: Option<std::thread::JoinHandle<Vec<&'static str>>>,
     stopping: bool,
+    review: Option<Panel>,
+    review_opened: Option<Instant>,
     fatal: Option<String>,
 }
 
@@ -188,10 +196,16 @@ fn run() -> Result<(), String> {
         annotation: None,
         annotations: 0,
         handle: event_loop.handle(),
+        record_output: None,
+        audio_probe: None,
         stopping: false,
+        review: None,
+        review_opened: None,
         fatal: None,
     };
 
+    text::warm();
+    record::recover(&session::root());
     shortcuts::spawn(tx);
     eprintln!("nino: ready");
 
@@ -214,6 +228,9 @@ impl App {
                 }
             }
             Msg::Shortcut(Action::Record) => {
+                if self.review.is_some() {
+                    return;
+                }
                 if self.recording.is_some() {
                     self.stop_recording();
                 } else if self.overlay.as_ref().is_some_and(|o| !o.is_shot()) {
@@ -231,17 +248,18 @@ impl App {
                 }
             }
             Msg::RecordingDone(result) => {
-                self.recording = None;
+                let rec = self.recording.take();
                 self.stopping = false;
                 self.finish_keys(false);
                 self.close_ring();
                 match result {
-                    Ok(path) => {
-                        eprintln!("nino: saved {}", path.display());
-                        if let Some(session) = self.session.as_mut() {
-                            session.video = Some(path);
-                        }
+                    Ok(recorded) if self.session.as_ref().is_some_and(|s| !s.cancelled) => {
+                        let size = rec.map(|r| r.size).unwrap_or((0, 0));
+                        let duration = self.session.as_ref().map_or(0.0, |s| s.elapsed().as_secs_f32());
+                        eprintln!("nino: recorded {}", recorded.path.display());
+                        self.open_review(recorded, size, duration);
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         eprintln!("nino: recording failed: {e}");
                         self.notify("Falha na gravação", &e);
@@ -255,6 +273,12 @@ impl App {
                         Some(message) => self.editor_message(&message),
                         None => self.end_annotation(None),
                     }
+                }
+            }
+            Msg::Media(ev) => {
+                if let Some(r) = self.review.as_mut() {
+                    let outcome = r.review.media(ev);
+                    self.apply_review(outcome);
                 }
             }
             Msg::Fatal(e) => self.fatal = Some(e),
@@ -491,7 +515,7 @@ impl App {
     }
 
     fn finish_session(&mut self) {
-        if self.recording.is_some() || self.annotation.is_some() {
+        if self.recording.is_some() || self.annotation.is_some() || self.review.is_some() {
             return;
         }
         let Some(session) = self.session.take() else { return };
@@ -567,6 +591,124 @@ impl App {
         let (layer, viewport) = self.new_layer(KeyboardInteractivity::Exclusive);
         self.opened_at = Some((started, Duration::ZERO));
         self.overlay = Some(Overlay::new(layer, viewport, Mode::Record));
+        self.audio_probe = Some(std::thread::spawn(record::audio_devices));
+    }
+
+    fn open_review(&mut self, recorded: record::Recorded, size: (u32, u32), duration: f32) {
+        let raw = recorded.path;
+        let started = Instant::now();
+        let output = self.record_output.take().or_else(|| self.output_state.outputs().next());
+        let scale = output
+            .as_ref()
+            .and_then(|o| self.output_state.info(o))
+            .map(|i| i.scale_factor.max(1) as f32)
+            .unwrap_or(1.0);
+        let qh = &self.qh;
+        let surface = self.compositor.create_surface(qh);
+        let viewport = self.viewporter.get_viewport(&surface, qh, Ud);
+        let layer =
+            self.layer_shell
+                .create_layer_surface(qh, surface, Layer::Overlay, Some(NAMESPACE), output.as_ref());
+        layer.set_anchor(Anchor::empty());
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        match Review::new(scale, raw.clone(), size, duration, &recorded.audio, self.tx.clone()) {
+            Ok(review) => {
+                let r = Panel::new(layer, viewport, review);
+                let (x, y, w, h) = r.review.input_rect();
+                let region = self.compositor.wl_compositor().create_region(&self.qh, Ud);
+                region.add(x, y, w, h);
+                r.layer.wl_surface().set_input_region(Some(&region));
+                region.destroy();
+                r.layer.commit();
+                self.review = Some(r);
+                self.review_opened = Some(started);
+            }
+            Err(e) => {
+                viewport.destroy();
+                drop(layer);
+                eprintln!("nino: review: {e}");
+                let video = match record::publish(&raw, &raw) {
+                    Ok(to) => to,
+                    Err(err) => {
+                        eprintln!("nino: publish {}: {err}", raw.display());
+                        raw
+                    }
+                };
+                self.notify("Falha ao abrir a revisão", &format!("Vídeo sem cortes em {}", video.display()));
+                if let Some(session) = self.session.as_mut() {
+                    session.video = Some(video);
+                }
+            }
+        }
+    }
+
+    fn close_review(&mut self) {
+        if let Some(r) = self.review.take() {
+            r.viewport.destroy();
+            drop(r);
+        }
+    }
+
+    fn apply_review(&mut self, outcome: review::Outcome) {
+        match outcome {
+            review::Outcome::Nothing => {}
+            review::Outcome::Redraw => {
+                if let Some(r) = self.review.as_mut() {
+                    r.dirty = true;
+                }
+                let qh = self.qh.clone();
+                self.redraw_review(&qh);
+            }
+            review::Outcome::Close => {
+                self.close_review();
+                self.finish_session();
+            }
+            review::Outcome::Copied { path, from, to } => {
+                self.close_review();
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                eprintln!("nino: saved {} ({} KiB)", path.display(), size / 1024);
+                if let Some(session) = self.session.as_mut() {
+                    session.video = Some(path);
+                    session.trim(from, to);
+                }
+                self.finish_session();
+            }
+            review::Outcome::Failed(e) => {
+                eprintln!("nino: copy failed: {e}");
+                self.notify("Falha ao preparar o vídeo", &e);
+                let qh = self.qh.clone();
+                self.redraw_review(&qh);
+            }
+        }
+    }
+
+    fn redraw_review(&mut self, qh: &QueueHandle<Self>) {
+        let Some(r) = self.review.as_mut() else { return };
+        if !r.configured {
+            return;
+        }
+        if r.frame_pending {
+            r.dirty = true;
+            return;
+        }
+        let render_started = Instant::now();
+        if let Err(e) = r.present(&mut self.pool) {
+            eprintln!("nino: present review: {e}");
+            return;
+        }
+        let surface = r.layer.wl_surface();
+        surface.frame(qh, FrameCallbackData(surface.clone()));
+        r.layer.commit();
+        r.dirty = false;
+        r.frame_pending = true;
+        if let Some(started) = self.review_opened.take() {
+            eprintln!(
+                "nino: review shown in {:?} (render {:?})",
+                started.elapsed(),
+                render_started.elapsed()
+            );
+        }
     }
 
     fn new_layer(&self, keyboard: KeyboardInteractivity) -> (LayerSurface, WpViewport) {
@@ -684,6 +826,7 @@ impl App {
         let output = ov.output.clone().or_else(|| self.output_state.outputs().next());
         let info = output.as_ref().and_then(|o| self.output_state.info(o));
         let pos = info.as_ref().and_then(|i| i.logical_position).unwrap_or((0, 0));
+        self.record_output = output.clone();
         let screen = (ov.logical.0 as i32, ov.logical.1 as i32);
 
         let x0 = ((sel.x / ov.scale).floor() as i32).clamp(0, screen.0) & !1;
@@ -719,8 +862,13 @@ impl App {
 
     fn begin_recording(&mut self, pending: PendingRecord) {
         let (x, y, w, h) = pending.global;
+        let wanted = record::wanted_audio();
+        let audio = match self.audio_probe.take().filter(|p| p.is_finished()).and_then(|p| p.join().ok()) {
+            Some(devices) => wanted.into_iter().filter(|a| devices.contains(a)).collect(),
+            None => wanted,
+        };
         let started = Session::new(pending.region, pending.screen).and_then(|session| {
-            let rec = Recording::start(session.video_path(), x, y, w, h, self.tx.clone())
+            let rec = Recording::start(record::raw_path(&session.dir), x, y, w, h, audio, self.tx.clone())
                 .inspect_err(|_| _ = std::fs::remove_dir(&session.dir))?;
             Ok((session, rec))
         });
@@ -777,6 +925,13 @@ impl CompositorHandler for App {
     }
 
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        if let Some(r) = self.review.as_mut().filter(|r| r.layer.wl_surface() == surface) {
+            r.frame_pending = false;
+            if r.dirty {
+                self.redraw_review(qh);
+            }
+            return;
+        }
         let Some(ov) = self.overlay.as_mut() else { return };
         if ov.layer.wl_surface() != surface {
             return;
@@ -819,6 +974,14 @@ impl LayerShellHandler for App {
         if self.ring.as_ref().is_some_and(|o| &o.layer == layer) {
             self.close_ring();
         }
+        if self.review.as_ref().is_some_and(|r| &r.layer == layer) {
+            let video = self.review.as_mut().and_then(|r| r.review.keep());
+            self.close_review();
+            if let Some(session) = self.session.as_mut() {
+                session.video = video;
+            }
+            self.finish_session();
+        }
     }
 
     fn configure(
@@ -829,6 +992,13 @@ impl LayerShellHandler for App {
         cfg: LayerSurfaceConfigure,
         _: u32,
     ) {
+        if let Some(r) = self.review.as_mut().filter(|r| &r.layer == layer) {
+            r.configured = true;
+            r.frame_pending = false;
+            r.dirty = true;
+            self.redraw_review(qh);
+            return;
+        }
         let Some(ov) = self.overlay.as_mut().filter(|o| &o.layer == layer) else {
             return;
         };
@@ -933,8 +1103,14 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        let Some(ov) = self.overlay.as_mut() else { return };
         let ctrl = self.modifiers.ctrl;
+        let Some(ov) = self.overlay.as_mut() else {
+            if let Some(r) = self.review.as_mut() {
+                let outcome = r.review.key(event.keysym, ctrl);
+                self.apply_review(outcome);
+            }
+            return;
+        };
         let outcome = match event.keysym {
             Keysym::Escape => Outcome::Close,
             Keysym::c | Keysym::C if ctrl && ov.is_shot() => Outcome::Copy,
@@ -983,6 +1159,32 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if let Some(r) = self.review.as_mut().filter(|r| r.layer.wl_surface() == &event.surface) {
+                let (x, y) = (
+                    event.position.0 as f32 / review::ZOOM,
+                    event.position.1 as f32 / review::ZOOM,
+                );
+                let outcome = match event.kind {
+                    PointerEventKind::Enter { serial } => {
+                        self.pointer_serial = serial;
+                        self.cursor = None;
+                        review::Outcome::Nothing
+                    }
+                    PointerEventKind::Motion { .. } => r.review.motion(x, y),
+                    PointerEventKind::Press { button: BTN_LEFT, .. } => r.review.press(x, y),
+                    PointerEventKind::Release { button: BTN_LEFT, .. } => r.review.release(),
+                    _ => review::Outcome::Nothing,
+                };
+                let shape = r.review.cursor_at(x, y);
+                if self.cursor != Some(shape) {
+                    if let Some(dev) = &self.cursor_device {
+                        dev.set_shape(self.pointer_serial, shape);
+                    }
+                    self.cursor = Some(shape);
+                }
+                self.apply_review(outcome);
+                continue;
+            }
             let Some(ov) = self.overlay.as_mut().filter(|o| o.layer.wl_surface() == &event.surface) else {
                 continue;
             };

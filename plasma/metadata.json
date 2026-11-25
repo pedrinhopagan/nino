@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "dev.pedrinhopagan.nino",
+        "Name": "Nino",
+        "Description": "Opções de gravação do Nino.",
+        "Icon": "nino",
+        "Category": "Multimedia",
+        "License": "MIT",
+        "EnabledByDefault": true,
+        "Version": "0.1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "ApplicationStatus"
+}

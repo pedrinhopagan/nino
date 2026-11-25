@@ -685,7 +685,7 @@ impl Overlay {
                 };
                 for &(x, y, w, h) in &self.holes {
                     let rect = Rect::from_xywh(x as f32 * s, y as f32 * s, w as f32 * s, h as f32 * s);
-                    if let Some(path) = rect.and_then(|r| rounded(r, 8.0 * s)) {
+                    if let Some(path) = rect.and_then(|r| draw::rounded(r, 8.0 * s)) {
                         frame.fill_path(&path, &clear, FillRule::Winding, Transform::identity(), None);
                     }
                 }
@@ -732,7 +732,7 @@ impl Overlay {
         let active = draw::paint(draw::rgba(255, 255, 255, 40));
         let faint = draw::paint(draw::rgba(255, 255, 255, 36));
         let current = self.current();
-        if let Some(path) = rounded(bar, 8.0 * s) {
+        if let Some(path) = draw::rounded(bar, 8.0 * s) {
             frame.fill_path(&path, &bg, FillRule::Winding, id, None);
         }
         for sep in seps {
@@ -743,7 +743,7 @@ impl Overlay {
                 Hit::Tool(tool) => tool == self.tool,
                 _ => self.palette_open,
             };
-            if on && let Some(path) = rounded(r, 6.0 * s) {
+            if on && let Some(path) = draw::rounded(r, 6.0 * s) {
                 frame.fill_path(&path, &active, FillRule::Winding, id, None);
             }
             let inset = 9.0 * s;
@@ -781,16 +781,16 @@ impl Overlay {
         }
 
         if let (Some(panel), Some((x0, x1, y))) = (self.slider_rect(), self.slider_track()) {
-            if let Some(path) = rounded(panel, 8.0 * s) {
+            if let Some(path) = draw::rounded(panel, 8.0 * s) {
                 frame.fill_path(&path, &bg, FillRule::Winding, id, None);
             }
             let knob = x0 + self.blur * (x1 - x0);
             let h = 4.0 * s;
-            if let Some(track) = Rect::from_ltrb(x0, y - h / 2.0, x1, y + h / 2.0).and_then(|r| rounded(r, h / 2.0)) {
+            if let Some(track) = Rect::from_ltrb(x0, y - h / 2.0, x1, y + h / 2.0).and_then(|r| draw::rounded(r, h / 2.0)) {
                 frame.fill_path(&track, &faint, FillRule::Winding, id, None);
             }
             if let Some(fill) =
-                Rect::from_ltrb(x0, y - h / 2.0, knob.max(x0 + h), y + h / 2.0).and_then(|r| rounded(r, h / 2.0))
+                Rect::from_ltrb(x0, y - h / 2.0, knob.max(x0 + h), y + h / 2.0).and_then(|r| draw::rounded(r, h / 2.0))
             {
                 frame.fill_path(&fill, &draw::paint(Color::WHITE), FillRule::Winding, id, None);
             }
@@ -802,7 +802,7 @@ impl Overlay {
         let (Some(panel), Some(swatches)) = (self.palette_rect(), self.swatch_rects()) else {
             return;
         };
-        if let Some(path) = rounded(panel, 8.0 * s) {
+        if let Some(path) = draw::rounded(panel, 8.0 * s) {
             frame.fill_path(&path, &bg, FillRule::Winding, id, None);
         }
         for (hit, r) in swatches {
@@ -810,7 +810,7 @@ impl Overlay {
                 Hit::Swatch(i) => swatch(frame, r, draw::palette(i), i == self.color && self.picked.is_none(), s),
                 _ => {
                     if self.picking
-                        && let Some(path) = rounded(r, 6.0 * s)
+                        && let Some(path) = draw::rounded(r, 6.0 * s)
                     {
                         frame.fill_path(&path, &active, FillRule::Winding, id, None);
                     }
@@ -922,26 +922,3 @@ fn blur_icon(frame: &mut PixmapMut, x: f32, y: f32, size: f32) {
     }
 }
 
-fn rounded(r: Rect, radius: f32) -> Option<tiny_skia::Path> {
-    let (x, y, w, h) = (r.x(), r.y(), r.width(), r.height());
-    let k = radius * 0.5523;
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + radius, y);
-    pb.line_to(x + w - radius, y);
-    pb.cubic_to(x + w - radius + k, y, x + w, y + radius - k, x + w, y + radius);
-    pb.line_to(x + w, y + h - radius);
-    pb.cubic_to(
-        x + w,
-        y + h - radius + k,
-        x + w - radius + k,
-        y + h,
-        x + w - radius,
-        y + h,
-    );
-    pb.line_to(x + radius, y + h);
-    pb.cubic_to(x + radius - k, y + h, x, y + h - radius + k, x, y + h - radius);
-    pb.line_to(x, y + radius);
-    pb.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
-    pb.close();
-    pb.finish()
-}
